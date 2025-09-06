@@ -1,26 +1,12 @@
 # telegram_bot.py
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram import Bot
 from config import TELEGRAM_BOT_TOKEN
-from signal_generator import run_signals
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Welcome! Use /help to see commands.")
+bot = Bot(token=TELEGRAM_BOT_TOKEN)
+CHAT_ID = "YOUR_TELEGRAM_CHAT_ID"  # replace with your Telegram user/chat ID
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("/start - Start bot\n/help - Show this help\n/signal - Get coin signals")
-
-async def signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    signals = run_signals()
-    msg = "\n".join([f"{coin}: {signal}" for coin, signal in signals.items()])
-    await update.message.reply_text(msg)
-
-def main():
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("signal", signal))
-    app.run_polling()
-
-if __name__ == "__main__":
-    main()
+def send_signal(message):
+    try:
+        bot.send_message(chat_id=CHAT_ID, text=message)
+    except Exception as e:
+        print(f"❌ Error sending Telegram message: {e}")
