@@ -1,22 +1,29 @@
-# main.py - start app, pusher, background labeling loop
-import asyncio, signal, sys, logging
-from telegram_bot import build_app if False else None
-# We import build_app dynamically to avoid circular import in template
-from telegram_bot import build_app as _build_app, pusher as _pusher, background_loop as _background_loop
-from db import init_db
-from config import PUSH_INTERVAL_MINUTES
+# main.py
 
+# Standard imports
+import asyncio
+
+# Safe optional import
+try:
+    from telegram_bot import build_app
+except ImportError:
+    build_app = None
+
+# Import your signal generator
+from signal_generator import run_signals
+
+# Your list of coins (example, replace with your actual coins)
+coins = [
+    "BTC", "ETH", "USDT", "BNB", "XRP", "ADA", "DOGE", "MATIC", "SOL", "DOT",
+    "SHIB", "LTC", "TRX", "AVAX", "UNI", "CRO", "NEAR", "FTM", "ATOM", "ALGO",
+    # Add the rest of your coins here
+]
+
+# Main async function to run signals
 async def main():
-    init_db()
-    app = _build_app()
-    try:
-        await app.bot.delete_webhook()
-    except Exception:
-        pass
-    # start background tasks
-    asyncio.create_task(_pusher(app))
-    asyncio.create_task(_background_loop(app))
-    await app.run_polling()
+    # Run your signals
+    await run_signals(coins)
 
-if __name__ == '__main__':
+# Run the bot
+if __name__ == "__main__":
     asyncio.run(main())
