@@ -11,11 +11,10 @@ def run_signals(coins):
     for coin in coins:
         try:
             data = fetch_cmc_data(coin)
-            # Example logic: long or short based on market cap or price change
+            # Example logic: long or short based on market trend
             signal = "📈 Long-term" if data.get("trend") == "up" else "📉 Short-term"
             results[coin] = signal
         except Exception as e:
             results[coin] = f"❌ Error fetching signal ({e})"
 
-    # Send signals to Telegram
     send_signal(results)
