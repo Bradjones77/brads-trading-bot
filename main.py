@@ -1,4 +1,4 @@
-# Entry point
+# main.py
 from telegram_bot import main
 
 if __name__ == "__main__":
