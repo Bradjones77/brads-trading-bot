@@ -1,29 +1,10 @@
 # main.py
-
-# Standard imports
-import asyncio
-
-# Safe optional import
-try:
-    from telegram_bot import build_app
-except ImportError:
-    build_app = None
-
-# Import your signal generator
 from signal_generator import run_signals
 
-# Your list of coins (example, replace with your actual coins)
+# Example list of coins you want to track
 coins = [
-    "BTC", "ETH", "USDT", "BNB", "XRP", "ADA", "DOGE", "MATIC", "SOL", "DOT",
-    "SHIB", "LTC", "TRX", "AVAX", "UNI", "CRO", "NEAR", "FTM", "ATOM", "ALGO",
-    # Add the rest of your coins here
+    "BTC", "ETH", "USDT", "BNB", "DOGE", "ADA", "SOL", "MATIC", "XRP"
 ]
 
-# Main async function to run signals
-async def main():
-    # Run your signals
-    await run_signals(coins)
-
-# Run the bot
 if __name__ == "__main__":
-    asyncio.run(main())
+    run_signals(coins)
