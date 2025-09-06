@@ -1,15 +1,27 @@
 # signal_generator.py
 from data_fetcher import fetch_cmc_data
-from config import COINS
+from telegram_bot import send_signal
+import random
+
+# Example logic for long/short signals
+def generate_signal(coin):
+    # Randomly pick Long or Short for demonstration
+    signal_type = random.choice(["📈 Long-term", "📉 Short-term"])
+    price = coin.get("quote", {}).get("USD", {}).get("price", 0)
+    symbol = coin.get("symbol", "N/A")
+    return f"{symbol} {signal_type} 💰 Price: ${price:.2f}"
 
 def run_signals():
-    data = fetch_cmc_data()
-    signals = {}
-    for coin in COINS:
-        coin_data = next((x for x in data if x["symbol"] == coin), None)
-        if coin_data:
-            # Simple example: bullish if 24h % change > 2%
-            signals[coin] = "📈 Buy" if coin_data["quote"]["USD"]["percent_change_24h"] > 2 else "📉 Hold/Sell"
-        else:
-            signals[coin] = "❌ No data"
-    return signals
+    coins = fetch_cmc_data()
+    if not coins:
+        send_signal("❌ Could not fetch any coin data.")
+        return
+
+    messages = []
+    for coin in coins[:50]:  # limit to top 50 coins for Telegram messages
+        msg = generate_signal(coin)
+        messages.append(msg)
+
+    # Send messages to Telegram one by one
+    for message in messages:
+        send_signal(message)
