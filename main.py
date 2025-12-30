@@ -1,6 +1,7 @@
 import os
 import time
 import requests
+import sqlite3
 from datetime import datetime, timezone
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -10,41 +11,59 @@ CHECK_EVERY_SECONDS = 300
 MAJORS_TOP_N = 30
 MAX_ALERTS_PER_LOOP = 8
 
-# Major thresholds (stricter)
+# Major thresholds
 MAJOR_MIN_24H = 2.0
 MAJOR_MIN_1H  = 0.6
 
-# Meme thresholds (looser = more alerts)
+# Meme thresholds
 MEME_MIN_24H = 4.0
 MEME_MIN_1H  = 1.2
 
-# Meme coins (CoinGecko IDs) – we can expand later
 MEME_IDS = [
-    "dogecoin",
-    "shiba-inu",
-    "pepe",
-    "bonk",
-    "dogwifcoin",
-    "floki",
-    "baby-doge-coin",
-    "memecoin-2",
-    "book-of-meme",
-    "mog-coin",
+    "dogecoin", "shiba-inu", "pepe", "bonk", "dogwifcoin",
+    "floki", "baby-doge-coin", "memecoin-2", "book-of-meme", "mog-coin",
 ]
 
-# Cooldowns
-MAJOR_COOLDOWN = 60 * 60          # 1 hour
-MEME_COOLDOWN  = 2 * 60 * 60      # 2 hours (memes spam more)
+MAJOR_COOLDOWN = 60 * 60
+MEME_COOLDOWN  = 2 * 60 * 60
+last_alert_time = {}
 
-last_alert_time = {}  # key: "BTC:BUY" -> unix time
+DB_PATH = "signals.db"
+
+def db_connect():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS signals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts_utc TEXT NOT NULL,
+            category TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            coin_id TEXT NOT NULL,
+            side TEXT NOT NULL,
+            entry REAL NOT NULL,
+            stop_loss REAL NOT NULL,
+            tp1 REAL NOT NULL,
+            tp2 REAL NOT NULL,
+            tp3 REAL NOT NULL,
+            conf INTEGER NOT NULL,
+            chg1h REAL,
+            chg24 REAL
+        )
+    """)
+    conn.commit()
+    return conn
+
+def db_insert_signal(conn, ts_utc, category, symbol, coin_id, side, entry, sl, tp1, tp2, tp3, conf, chg1h, chg24):
+    conn.execute("""
+        INSERT INTO signals (
+            ts_utc, category, symbol, coin_id, side, entry, stop_loss, tp1, tp2, tp3, conf, chg1h, chg24
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (ts_utc, category, symbol, coin_id, side, entry, sl, tp1, tp2, tp3, conf, chg1h, chg24))
+    conn.commit()
 
 def send_message(text: str):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": text,
-        "parse_mode": "Markdown"
-    }
+    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}
     r = requests.post(url, json=payload, timeout=20)
     print("Telegram:", r.status_code)
 
@@ -111,13 +130,13 @@ def build_trade_levels(coin_id: str, entry: float, side: str):
     if not ohlc or len(ohlc) < 30:
         return None
 
-    recent = ohlc[-144:] if len(ohlc) >= 144 else ohlc  # ~12h
+    recent = ohlc[-144:] if len(ohlc) >= 144 else ohlc
     highs = [c[2] for c in recent]
     lows  = [c[3] for c in recent]
     swing_high = max(highs)
     swing_low = min(lows)
 
-    buffer_pct = 0.003  # 0.3% (memes wick more, still ok for majors)
+    buffer_pct = 0.003
 
     if side == "BUY":
         sl = swing_low * (1 - buffer_pct)
@@ -177,71 +196,75 @@ def main():
     if not BOT_TOKEN or not CHAT_ID:
         raise RuntimeError("BOT_TOKEN or CHAT_ID is missing")
 
-    send_message("🔥✅ *Meme Mode Enabled!* Now scanning MAJORS + MEMES for BUY/SELL + TP1–TP3 + SL 🚀")
+    conn = db_connect()
+
+    send_message("📊✅ *Tracking Enabled!* Signals will now be saved to the database. 🚀")
 
     while True:
         try:
-            now = datetime.now(timezone.utc).strftime("%H:%M UTC")
+            now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            now_short = datetime.now(timezone.utc).strftime("%H:%M UTC")
 
             majors = fetch_markets_top(MAJORS_TOP_N)
             memes = fetch_markets_ids(MEME_IDS)
 
             alerts = []
 
-            # Majors
+            def handle_coin(c, category: str, min24: float, min1h: float, cooldown: int):
+                sym = c["symbol"].upper()
+                coin_id = c["id"]
+                entry = float(c["current_price"])
+
+                chg1h = c.get("price_change_percentage_1h_in_currency")
+                chg24 = c.get("price_change_percentage_24h")
+                if chg1h is None or chg24 is None:
+                    return
+
+                side = detect_side(float(chg24), float(chg1h), min24, min1h)
+                if not side:
+                    return
+                if not should_alert(sym, side, cooldown):
+                    return
+
+                levels = build_trade_levels(coin_id, entry, side)
+                if not levels:
+                    return
+
+                conf = score_signal(float(chg24), float(chg1h), side)
+
+                # Save to DB
+                db_insert_signal(
+                    conn,
+                    ts_utc=now_utc,
+                    category=category,
+                    symbol=sym,
+                    coin_id=coin_id,
+                    side=side,
+                    entry=entry,
+                    sl=levels["sl"],
+                    tp1=levels["tp1"],
+                    tp2=levels["tp2"],
+                    tp3=levels["tp3"],
+                    conf=conf,
+                    chg1h=float(chg1h),
+                    chg24=float(chg24),
+                )
+
+                msg = format_signal(sym, side, entry, levels, float(chg1h), float(chg24), conf, now_short, category)
+                alerts.append((conf, msg))
+
             for c in majors:
-                sym = c["symbol"].upper()
-                coin_id = c["id"]
-                entry = float(c["current_price"])
-                chg1h = c.get("price_change_percentage_1h_in_currency")
-                chg24 = c.get("price_change_percentage_24h")
-                if chg1h is None or chg24 is None:
-                    continue
+                handle_coin(c, "MAJOR", MAJOR_MIN_24H, MAJOR_MIN_1H, MAJOR_COOLDOWN)
 
-                side = detect_side(float(chg24), float(chg1h), MAJOR_MIN_24H, MAJOR_MIN_1H)
-                if not side:
-                    continue
-                if not should_alert(sym, side, MAJOR_COOLDOWN):
-                    continue
-
-                levels = build_trade_levels(coin_id, entry, side)
-                if not levels:
-                    continue
-
-                conf = score_signal(float(chg24), float(chg1h), side)
-                msg = format_signal(sym, side, entry, levels, float(chg1h), float(chg24), conf, now, "MAJOR")
-                alerts.append((conf, msg))
-
-            # Memes
             for c in memes:
-                sym = c["symbol"].upper()
-                coin_id = c["id"]
-                entry = float(c["current_price"])
-                chg1h = c.get("price_change_percentage_1h_in_currency")
-                chg24 = c.get("price_change_percentage_24h")
-                if chg1h is None or chg24 is None:
-                    continue
-
-                side = detect_side(float(chg24), float(chg1h), MEME_MIN_24H, MEME_MIN_1H)
-                if not side:
-                    continue
-                if not should_alert(sym, side, MEME_COOLDOWN):
-                    continue
-
-                levels = build_trade_levels(coin_id, entry, side)
-                if not levels:
-                    continue
-
-                conf = score_signal(float(chg24), float(chg1h), side)
-                msg = format_signal(sym, side, entry, levels, float(chg1h), float(chg24), conf, now, "MEME")
-                alerts.append((conf, msg))
+                handle_coin(c, "MEME", MEME_MIN_24H, MEME_MIN_1H, MEME_COOLDOWN)
 
             if alerts:
                 alerts.sort(key=lambda x: x[0], reverse=True)
                 top = alerts[:MAX_ALERTS_PER_LOOP]
-                send_message("🚨🔥 *NEW SETUPS INCOMING!* 🔥🚨\n\n" + "\n\n".join(m for _, m in top))
+                send_message("🚨🔥 *NEW SETUPS + LOGGED!* 🔥🚨\n\n" + "\n\n".join(m for _, m in top))
             else:
-                print("No setups", now)
+                print("No setups", now_short)
 
         except Exception as e:
             print("Error:", repr(e))
