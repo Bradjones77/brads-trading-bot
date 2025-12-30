@@ -1,273 +1,220 @@
 import os
 import time
 import requests
-import sqlite3
+import psycopg2
 from datetime import datetime, timezone
 
+# ======================
+# ENVIRONMENT VARIABLES
+# ======================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
+if not BOT_TOKEN or not CHAT_ID or not DATABASE_URL:
+    raise RuntimeError("BOT_TOKEN, CHAT_ID, or DATABASE_URL missing")
+
+# ======================
+# SETTINGS
+# ======================
 CHECK_EVERY_SECONDS = 300
 MAJORS_TOP_N = 30
-MAX_ALERTS_PER_LOOP = 8
+MAX_ALERTS_PER_LOOP = 6
 
-# Major thresholds
 MAJOR_MIN_24H = 2.0
-MAJOR_MIN_1H  = 0.6
+MAJOR_MIN_1H = 0.6
 
-# Meme thresholds
 MEME_MIN_24H = 4.0
-MEME_MIN_1H  = 1.2
+MEME_MIN_1H = 1.2
 
 MEME_IDS = [
     "dogecoin", "shiba-inu", "pepe", "bonk", "dogwifcoin",
-    "floki", "baby-doge-coin", "memecoin-2", "book-of-meme", "mog-coin",
+    "floki", "baby-doge-coin", "mog-coin", "book-of-meme"
 ]
 
 MAJOR_COOLDOWN = 60 * 60
-MEME_COOLDOWN  = 2 * 60 * 60
+MEME_COOLDOWN = 2 * 60 * 60
 last_alert_time = {}
 
-DB_PATH = "signals.db"
-
+# ======================
+# DATABASE
+# ======================
 def db_connect():
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("""
+    conn = psycopg2.connect(DATABASE_URL)
+    cur = conn.cursor()
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS signals (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             ts_utc TEXT NOT NULL,
             category TEXT NOT NULL,
             symbol TEXT NOT NULL,
             coin_id TEXT NOT NULL,
             side TEXT NOT NULL,
-            entry REAL NOT NULL,
-            stop_loss REAL NOT NULL,
-            tp1 REAL NOT NULL,
-            tp2 REAL NOT NULL,
-            tp3 REAL NOT NULL,
-            conf INTEGER NOT NULL,
-            chg1h REAL,
-            chg24 REAL
+            entry DOUBLE PRECISION NOT NULL,
+            stop_loss DOUBLE PRECISION NOT NULL,
+            tp1 DOUBLE PRECISION NOT NULL,
+            tp2 DOUBLE PRECISION NOT NULL,
+            tp3 DOUBLE PRECISION NOT NULL,
+            confidence INTEGER NOT NULL,
+            chg1h DOUBLE PRECISION,
+            chg24 DOUBLE PRECISION
         )
     """)
     conn.commit()
     return conn
 
-def db_insert_signal(conn, ts_utc, category, symbol, coin_id, side, entry, sl, tp1, tp2, tp3, conf, chg1h, chg24):
-    conn.execute("""
-        INSERT INTO signals (
-            ts_utc, category, symbol, coin_id, side, entry, stop_loss, tp1, tp2, tp3, conf, chg1h, chg24
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (ts_utc, category, symbol, coin_id, side, entry, sl, tp1, tp2, tp3, conf, chg1h, chg24))
+def db_insert(conn, data):
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO signals
+        (ts_utc, category, symbol, coin_id, side, entry, stop_loss, tp1, tp2, tp3, confidence, chg1h, chg24)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+    """, data)
     conn.commit()
 
-def send_message(text: str):
+# ======================
+# TELEGRAM
+# ======================
+def send_message(text):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}
-    r = requests.post(url, json=payload, timeout=20)
-    print("Telegram:", r.status_code)
+    payload = {
+        "chat_id": CHAT_ID,
+        "text": text,
+        "parse_mode": "Markdown"
+    }
+    requests.post(url, json=payload, timeout=20)
 
-def fetch_markets_top(top_n: int):
+# ======================
+# MARKET DATA (CoinGecko)
+# ======================
+def fetch_markets(top_n=None, ids=None):
     url = "https://api.coingecko.com/api/v3/coins/markets"
     params = {
         "vs_currency": "usd",
         "order": "market_cap_desc",
-        "per_page": top_n,
-        "page": 1,
         "sparkline": "false",
-        "price_change_percentage": "1h,24h",
+        "price_change_percentage": "1h,24h"
     }
+    if top_n:
+        params["per_page"] = top_n
+        params["page"] = 1
+    if ids:
+        params["ids"] = ",".join(ids)
+        params["per_page"] = len(ids)
+
     r = requests.get(url, params=params, timeout=30)
     r.raise_for_status()
     return r.json()
 
-def fetch_markets_ids(ids: list[str]):
-    url = "https://api.coingecko.com/api/v3/coins/markets"
-    params = {
-        "vs_currency": "usd",
-        "ids": ",".join(ids),
-        "order": "market_cap_desc",
-        "per_page": len(ids),
-        "page": 1,
-        "sparkline": "false",
-        "price_change_percentage": "1h,24h",
-    }
-    r = requests.get(url, params=params, timeout=30)
-    r.raise_for_status()
-    return r.json()
-
-def fetch_ohlc(coin_id: str, days: int = 1):
+def fetch_ohlc(coin_id):
     url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/ohlc"
-    params = {"vs_currency": "usd", "days": days}
-    r = requests.get(url, params=params, timeout=30)
+    r = requests.get(url, params={"vs_currency": "usd", "days": 1}, timeout=30)
     r.raise_for_status()
     return r.json()
 
-def pretty_price(x: float) -> str:
-    return f"${x:,.6f}" if x < 1 else f"${x:,.2f}"
-
-def clamp(n, lo, hi):
-    return max(lo, min(hi, n))
-
-def score_signal(chg24: float, chg1h: float, side: str) -> int:
-    trend_pts = clamp(int(abs(chg24) * 6), 0, 60)
-    mom_pts   = clamp(int(abs(chg1h) * 30), 0, 30)
-    aligned = (chg24 > 0 and chg1h > 0 and side == "BUY") or (chg24 < 0 and chg1h < 0 and side == "SELL")
-    bonus = 10 if aligned else -10
-    return clamp(trend_pts + mom_pts + bonus, 0, 100)
-
-def should_alert(symbol: str, side: str, cooldown: int) -> bool:
+# ======================
+# LOGIC
+# ======================
+def should_alert(symbol, side, cooldown):
     now = int(time.time())
     key = f"{symbol}:{side}"
-    last = last_alert_time.get(key, 0)
-    if now - last < cooldown:
+    if now - last_alert_time.get(key, 0) < cooldown:
         return False
     last_alert_time[key] = now
     return True
 
-def build_trade_levels(coin_id: str, entry: float, side: str):
-    ohlc = fetch_ohlc(coin_id, days=1)
-    if not ohlc or len(ohlc) < 30:
-        return None
+def score(conf24, conf1h):
+    return min(100, int(abs(conf24)*6 + abs(conf1h)*30))
 
-    recent = ohlc[-144:] if len(ohlc) >= 144 else ohlc
-    highs = [c[2] for c in recent]
-    lows  = [c[3] for c in recent]
-    swing_high = max(highs)
-    swing_low = min(lows)
-
-    buffer_pct = 0.003
+def build_levels(coin_id, entry, side):
+    ohlc = fetch_ohlc(coin_id)
+    highs = [x[2] for x in ohlc]
+    lows = [x[3] for x in ohlc]
 
     if side == "BUY":
-        sl = swing_low * (1 - buffer_pct)
+        sl = min(lows) * 0.997
         risk = entry - sl
-        if risk <= 0:
-            return None
-        tp1 = entry + 1 * risk
-        tp2 = entry + 2 * risk
-        tp3 = entry + 3 * risk
+        return sl, entry+risk, entry+2*risk, entry+3*risk
     else:
-        sl = swing_high * (1 + buffer_pct)
+        sl = max(highs) * 1.003
         risk = sl - entry
-        if risk <= 0:
-            return None
-        tp1 = entry - 1 * risk
-        tp2 = entry - 2 * risk
-        tp3 = entry - 3 * risk
+        return sl, entry-risk, entry-2*risk, entry-3*risk
 
-    return {"sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3, "risk_pct": (risk / entry) * 100.0}
+def fmt(p):
+    return f"${p:,.6f}" if p < 1 else f"${p:,.2f}"
 
-def format_signal(sym: str, side: str, entry: float, levels: dict, chg1h: float, chg24: float, conf: int, now: str, category: str) -> str:
-    if category == "MEME":
-        tag = "💥🐶 *MEME COIN* 🐸💥"
-        header = f"🔥🚀💰 *{sym} {side} SIGNAL* 💰🚀🔥"
-    else:
-        tag = "🏛️📊 *MAJOR COIN* 📊🏛️"
-        header = f"🚨💎 *{sym} {side} SETUP* 💎🚨"
-
-    side_emoji = "🟢📈" if side == "BUY" else "🔴📉"
+def format_msg(cat, sym, side, entry, sl, tp1, tp2, tp3, conf, chg1h, chg24, time_str):
+    emoji = "🔥🚀💰" if cat == "MEME" else "🚨💎"
+    arrow = "🟢📈" if side == "BUY" else "🔴📉"
 
     return (
-        f"{tag}\n"
-        f"{header}\n"
-        f"{side_emoji} *Action:* {side}\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"🎯 *Entry:* {pretty_price(entry)}\n"
-        f"🛑 *Stop Loss:* {pretty_price(levels['sl'])}\n"
-        f"✅ *TP1:* {pretty_price(levels['tp1'])}\n"
-        f"✅ *TP2:* {pretty_price(levels['tp2'])}\n"
-        f"✅ *TP3:* {pretty_price(levels['tp3'])}\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"⚡ *Momentum:* 1h {chg1h:+.2f}% | 24h {chg24:+.2f}%\n"
+        f"{emoji} *{sym} {side} SIGNAL* {emoji}\n"
+        f"{arrow} *Action:* {side}\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"🎯 *Entry:* {fmt(entry)}\n"
+        f"🛑 *Stop Loss:* {fmt(sl)}\n"
+        f"✅ *TP1:* {fmt(tp1)}\n"
+        f"✅ *TP2:* {fmt(tp2)}\n"
+        f"✅ *TP3:* {fmt(tp3)}\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"⚡ 1h: {chg1h:+.2f}% | 24h: {chg24:+.2f}%\n"
         f"🧠 *Confidence:* {conf}/100\n"
-        f"⚖️ *Risk:* ~{levels['risk_pct']:.2f}%\n"
-        f"⏰ *Time:* {now}\n"
-        f"💎 *Manage risk — not financial advice.*"
+        f"⏰ {time_str}\n"
+        f"_Not financial advice_"
     )
 
-def detect_side(chg24: float, chg1h: float, min24: float, min1h: float):
-    if chg24 >= min24 and chg1h >= min1h:
-        return "BUY"
-    if chg24 <= -min24 and chg1h <= -min1h:
-        return "SELL"
-    return None
-
+# ======================
+# MAIN LOOP
+# ======================
 def main():
-    if not BOT_TOKEN or not CHAT_ID:
-        raise RuntimeError("BOT_TOKEN or CHAT_ID is missing")
-
     conn = db_connect()
-
-    send_message("📊✅ *Tracking Enabled!* Signals will now be saved to the database. 🚀")
+    send_message("📊✅ *Tracking Enabled!* Signals are now logged to PostgreSQL 🚀")
 
     while True:
         try:
-            now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-            now_short = datetime.now(timezone.utc).strftime("%H:%M UTC")
-
-            majors = fetch_markets_top(MAJORS_TOP_N)
-            memes = fetch_markets_ids(MEME_IDS)
-
+            now = datetime.now(timezone.utc).strftime("%H:%M UTC")
             alerts = []
 
-            def handle_coin(c, category: str, min24: float, min1h: float, cooldown: int):
-                sym = c["symbol"].upper()
-                coin_id = c["id"]
-                entry = float(c["current_price"])
+            majors = fetch_markets(top_n=MAJORS_TOP_N)
+            memes = fetch_markets(ids=MEME_IDS)
 
-                chg1h = c.get("price_change_percentage_1h_in_currency")
-                chg24 = c.get("price_change_percentage_24h")
-                if chg1h is None or chg24 is None:
-                    return
+            for group, data, min24, min1h, cd in [
+                ("MAJOR", majors, MAJOR_MIN_24H, MAJOR_MIN_1H, MAJOR_COOLDOWN),
+                ("MEME", memes, MEME_MIN_24H, MEME_MIN_1H, MEME_COOLDOWN),
+            ]:
+                for c in data:
+                    sym = c["symbol"].upper()
+                    chg1h = c["price_change_percentage_1h_in_currency"]
+                    chg24 = c["price_change_percentage_24h"]
 
-                side = detect_side(float(chg24), float(chg1h), min24, min1h)
-                if not side:
-                    return
-                if not should_alert(sym, side, cooldown):
-                    return
+                    if chg1h is None or chg24 is None:
+                        continue
 
-                levels = build_trade_levels(coin_id, entry, side)
-                if not levels:
-                    return
+                    side = "BUY" if chg24 > min24 and chg1h > min1h else \
+                           "SELL" if chg24 < -min24 and chg1h < -min1h else None
+                    if not side:
+                        continue
+                    if not should_alert(sym, side, cd):
+                        continue
 
-                conf = score_signal(float(chg24), float(chg1h), side)
+                    entry = float(c["current_price"])
+                    sl, tp1, tp2, tp3 = build_levels(c["id"], entry, side)
+                    conf = score(chg24, chg1h)
 
-                # Save to DB
-                db_insert_signal(
-                    conn,
-                    ts_utc=now_utc,
-                    category=category,
-                    symbol=sym,
-                    coin_id=coin_id,
-                    side=side,
-                    entry=entry,
-                    sl=levels["sl"],
-                    tp1=levels["tp1"],
-                    tp2=levels["tp2"],
-                    tp3=levels["tp3"],
-                    conf=conf,
-                    chg1h=float(chg1h),
-                    chg24=float(chg24),
-                )
+                    db_insert(conn, (
+                        datetime.now(timezone.utc).isoformat(),
+                        group, sym, c["id"], side,
+                        entry, sl, tp1, tp2, tp3,
+                        conf, chg1h, chg24
+                    ))
 
-                msg = format_signal(sym, side, entry, levels, float(chg1h), float(chg24), conf, now_short, category)
-                alerts.append((conf, msg))
-
-            for c in majors:
-                handle_coin(c, "MAJOR", MAJOR_MIN_24H, MAJOR_MIN_1H, MAJOR_COOLDOWN)
-
-            for c in memes:
-                handle_coin(c, "MEME", MEME_MIN_24H, MEME_MIN_1H, MEME_COOLDOWN)
+                    alerts.append(format_msg(group, sym, side, entry, sl, tp1, tp2, tp3, conf, chg1h, chg24, now))
 
             if alerts:
-                alerts.sort(key=lambda x: x[0], reverse=True)
-                top = alerts[:MAX_ALERTS_PER_LOOP]
-                send_message("🚨🔥 *NEW SETUPS + LOGGED!* 🔥🚨\n\n" + "\n\n".join(m for _, m in top))
-            else:
-                print("No setups", now_short)
+                send_message("🚨🔥 *NEW TRADE SETUPS* 🔥🚨\n\n" + "\n\n".join(alerts[:MAX_ALERTS_PER_LOOP]))
 
         except Exception as e:
-            print("Error:", repr(e))
+            print("Error:", e)
 
         time.sleep(CHECK_EVERY_SECONDS)
 
