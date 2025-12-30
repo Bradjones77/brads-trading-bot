@@ -38,7 +38,6 @@ def fetch_markets():
     return r.json()
 
 def fetch_ohlc(coin_id: str, days: int = 1):
-    # days=1 returns 5-minute candles
     url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/ohlc"
     params = {"vs_currency": "usd", "days": days}
     r = requests.get(url, params=params, timeout=30)
@@ -49,16 +48,14 @@ def clamp(n, lo, hi):
     return max(lo, min(hi, n))
 
 def score_signal(chg24: float, chg1h: float, side: str) -> int:
-    trend_pts = clamp(int(abs(chg24) * 6), 0, 60)      # up to 60
-    mom_pts   = clamp(int(abs(chg1h) * 30), 0, 30)     # up to 30
+    trend_pts = clamp(int(abs(chg24) * 6), 0, 60)
+    mom_pts   = clamp(int(abs(chg1h) * 30), 0, 30)
     aligned = (chg24 > 0 and chg1h > 0 and side == "BUY") or (chg24 < 0 and chg1h < 0 and side == "SELL")
     bonus = 10 if aligned else -10
     return clamp(trend_pts + mom_pts + bonus, 0, 100)
 
 def pretty_price(x: float) -> str:
-    if x < 1:
-        return f"${x:,.6f}"
-    return f"${x:,.2f}"
+    return f"${x:,.6f}" if x < 1 else f"${x:,.2f}"
 
 def should_alert(symbol: str, side: str) -> bool:
     now = int(time.time())
@@ -70,11 +67,6 @@ def should_alert(symbol: str, side: str) -> bool:
     return True
 
 def build_trade_levels(coin_id: str, entry: float, side: str):
-    """
-    Build Entry/SL/TPs using last ~12h of 5m OHLC.
-    BUY: SL near swing low, TPs at 1R/2R/3R
-    SELL: SL near swing high, TPs at 1R/2R/3R
-    """
     ohlc = fetch_ohlc(coin_id, days=1)
     if not ohlc or len(ohlc) < 30:
         return None
@@ -86,7 +78,6 @@ def build_trade_levels(coin_id: str, entry: float, side: str):
     swing_high = max(highs)
     swing_low = min(lows)
 
-    # small buffer so SL isn't exactly on the swing
     buffer_pct = 0.002  # 0.2%
 
     if side == "BUY":
@@ -114,11 +105,37 @@ def build_trade_levels(coin_id: str, entry: float, side: str):
         "risk_pct": (risk / entry) * 100.0,
     }
 
+def format_signal(sym: str, side: str, entry: float, levels: dict, chg1h: float, chg24: float, conf: int, now: str) -> str:
+    if side == "BUY":
+        header = f"🔥🚀💰 *{sym} BUY SIGNAL* 💰🚀🔥"
+        side_emoji = "🟢📈"
+    else:
+        header = f"⚠️🔥 *{sym} SELL SIGNAL* 🔥⚠️"
+        side_emoji = "🔴📉"
+
+    # Telegram Markdown (basic) – keep it safe/simple
+    return (
+        f"{header}\n"
+        f"{side_emoji} *Action:* {side}\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🎯 *Entry:* {pretty_price(entry)}\n"
+        f"🛑 *Stop Loss:* {pretty_price(levels['sl'])}\n"
+        f"✅ *TP1:* {pretty_price(levels['tp1'])}\n"
+        f"✅ *TP2:* {pretty_price(levels['tp2'])}\n"
+        f"✅ *TP3:* {pretty_price(levels['tp3'])}\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"⚡ *Momentum:* 1h {chg1h:+.2f}% | 24h {chg24:+.2f}%\n"
+        f"🧠 *Confidence:* {conf}/100\n"
+        f"⚖️ *Risk:* ~{levels['risk_pct']:.2f}%\n"
+        f"⏰ *Time:* {now}\n"
+        f"💎 *Manage risk — not financial advice.*"
+    )
+
 def main():
     if not BOT_TOKEN or not CHAT_ID:
         raise RuntimeError("BOT_TOKEN or CHAT_ID is missing")
 
-    send_message("🟢 Signal engine started (Professional BUY/SELL + TP1–TP3 + SL).")
+    send_message("🔥✅ Signals Bot upgraded: BUY/SELL + TP1/TP2/TP3 + SL (Hype Mode) 🚀")
 
     while True:
         try:
@@ -153,32 +170,15 @@ def main():
                     continue
 
                 conf = score_signal(float(chg24), float(chg1h), side)
-
-                emoji = "🟩" if side == "BUY" else "🟥"
-                action = "BUY" if side == "BUY" else "SELL"
-                title_emoji = "🚀" if side == "BUY" else "⚠️"
-
-                msg = (
-                    f"{title_emoji} {emoji} {sym} SIGNAL ({action})\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
-                    f"🎯 Entry: {pretty_price(entry)}\n"
-                    f"🛑 Stop Loss: {pretty_price(levels['sl'])}\n"
-                    f"✅ TP1: {pretty_price(levels['tp1'])}\n"
-                    f"✅ TP2: {pretty_price(levels['tp2'])}\n"
-                    f"✅ TP3: {pretty_price(levels['tp3'])}\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
-                    f"📊 Momentum: 1h {float(chg1h):+.2f}% | 24h {float(chg24):+.2f}%\n"
-                    f"🧠 Confidence: {conf}/100\n"
-                    f"⚖️ Risk (approx): {levels['risk_pct']:.2f}%\n"
-                    f"⏰ Time: {now}"
-                )
-
+                msg = format_signal(sym, side, entry, levels, float(chg1h), float(chg24), conf, now)
                 alerts.append((conf, msg))
 
             if alerts:
                 alerts.sort(key=lambda x: x[0], reverse=True)
                 top = alerts[:MAX_ALERTS_PER_LOOP]
-                send_message("📣 NEW TRADE SETUPS\n\n" + "\n\n".join(m for _, m in top))
+
+                # NOTE: markdown formatting used (*bold*). Telegram still accepts plain text if it strips it.
+                send_message("🚨🔥 *NEW TRADE SETUPS DROPPED!* 🔥🚨\n\n" + "\n\n".join(m for _, m in top))
             else:
                 print("No signals", now)
 
