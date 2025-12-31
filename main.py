@@ -18,7 +18,8 @@ if not BOT_TOKEN or not CHAT_ID or not DATABASE_URL:
 # SETTINGS
 # ======================
 CHECK_EVERY_SECONDS = 300
-MAJORS_TOP_N = 30
+MAJORS_TOP_N = 50
+MEMES_TOP_N = 50
 MAX_ALERTS_PER_LOOP = 6
 
 MAJOR_MIN_24H = 2.0
@@ -27,14 +28,13 @@ MAJOR_MIN_1H = 0.6
 MEME_MIN_24H = 4.0
 MEME_MIN_1H = 1.2
 
-MEME_IDS = [
-    "dogecoin", "shiba-inu", "pepe", "bonk", "dogwifcoin",
-    "floki", "baby-doge-coin", "mog-coin", "book-of-meme"
-]
-
 MAJOR_COOLDOWN = 60 * 60
 MEME_COOLDOWN = 2 * 60 * 60
 last_alert_time = {}
+
+# CoinGecko category for meme coins.
+# If you see empty results in logs, change to: "meme"
+MEME_CATEGORY = "meme-token"
 
 # ======================
 # DATABASE
@@ -87,20 +87,24 @@ def send_message(text):
 # ======================
 # MARKET DATA (CoinGecko)
 # ======================
-def fetch_markets(top_n=None, ids=None):
+def fetch_markets(top_n=None, ids=None, category=None, page=1):
     url = "https://api.coingecko.com/api/v3/coins/markets"
     params = {
         "vs_currency": "usd",
         "order": "market_cap_desc",
         "sparkline": "false",
-        "price_change_percentage": "1h,24h"
+        "price_change_percentage": "1h,24h",
+        "page": page,
     }
-    if top_n:
-        params["per_page"] = top_n
-        params["page"] = 1
+
+    if category:
+        params["category"] = category
+
     if ids:
         params["ids"] = ",".join(ids)
         params["per_page"] = len(ids)
+    else:
+        params["per_page"] = top_n or 50
 
     r = requests.get(url, params=params, timeout=30)
     r.raise_for_status()
@@ -124,7 +128,7 @@ def should_alert(symbol, side, cooldown):
     return True
 
 def score(conf24, conf1h):
-    return min(100, int(abs(conf24)*6 + abs(conf1h)*30))
+    return min(100, int(abs(conf24) * 6 + abs(conf1h) * 30))
 
 def build_levels(coin_id, entry, side):
     ohlc = fetch_ohlc(coin_id)
@@ -134,11 +138,11 @@ def build_levels(coin_id, entry, side):
     if side == "BUY":
         sl = min(lows) * 0.997
         risk = entry - sl
-        return sl, entry+risk, entry+2*risk, entry+3*risk
+        return sl, entry + risk, entry + 2 * risk, entry + 3 * risk
     else:
         sl = max(highs) * 1.003
         risk = sl - entry
-        return sl, entry-risk, entry-2*risk, entry-3*risk
+        return sl, entry - risk, entry - 2 * risk, entry - 3 * risk
 
 def fmt(p):
     return f"${p:,.6f}" if p < 1 else f"${p:,.2f}"
@@ -176,7 +180,7 @@ def main():
             alerts = []
 
             majors = fetch_markets(top_n=MAJORS_TOP_N)
-            memes = fetch_markets(ids=MEME_IDS)
+            memes = fetch_markets(top_n=MEMES_TOP_N, category=MEME_CATEGORY)
 
             for group, data, min24, min1h, cd in [
                 ("MAJOR", majors, MAJOR_MIN_24H, MAJOR_MIN_1H, MAJOR_COOLDOWN),
@@ -184,8 +188,8 @@ def main():
             ]:
                 for c in data:
                     sym = c["symbol"].upper()
-                    chg1h = c["price_change_percentage_1h_in_currency"]
-                    chg24 = c["price_change_percentage_24h"]
+                    chg1h = c.get("price_change_percentage_1h_in_currency")
+                    chg24 = c.get("price_change_percentage_24h")
 
                     if chg1h is None or chg24 is None:
                         continue
@@ -209,6 +213,14 @@ def main():
                     ))
 
                     alerts.append(format_msg(group, sym, side, entry, sl, tp1, tp2, tp3, conf, chg1h, chg24, now))
+
+                    # Stop early to avoid extra API calls once we have enough alerts
+                    if len(alerts) >= MAX_ALERTS_PER_LOOP:
+                        break
+
+                # Stop scanning the next group if we've hit the max
+                if len(alerts) >= MAX_ALERTS_PER_LOOP:
+                    break
 
             if alerts:
                 send_message("🚨🔥 *NEW TRADE SETUPS* 🔥🚨\n\n" + "\n\n".join(alerts[:MAX_ALERTS_PER_LOOP]))
