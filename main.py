@@ -17,7 +17,7 @@ if not BOT_TOKEN or not CHAT_ID or not DATABASE_URL:
 # ======================
 # SETTINGS
 # ======================
-CHECK_EVERY_SECONDS = 300
+CHECK_EVERY_SECONDS = 900  # 15 minutes
 MAJORS_TOP_N = 50
 MEMES_TOP_N = 50
 MAX_ALERTS_PER_LOOP = 6
@@ -32,9 +32,9 @@ MAJOR_COOLDOWN = 60 * 60
 MEME_COOLDOWN = 2 * 60 * 60
 last_alert_time = {}
 
-# CoinGecko category for meme coins.
-# If you see empty results in logs, change to: "meme"
 MEME_CATEGORY = "meme-token"
+
+BOT_START_TIME = time.time()
 
 # ======================
 # DATABASE
@@ -84,37 +84,43 @@ def send_message(text):
     }
     requests.post(url, json=payload, timeout=20)
 
+def get_updates(offset=None):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
+    params = {"timeout": 30}
+    if offset:
+        params["offset"] = offset
+    r = requests.get(url, params=params, timeout=30)
+    r.raise_for_status()
+    return r.json()["result"]
+
 # ======================
-# MARKET DATA (CoinGecko)
+# MARKET DATA
 # ======================
-def fetch_markets(top_n=None, ids=None, category=None, page=1):
+def fetch_markets(top_n=None, category=None):
     url = "https://api.coingecko.com/api/v3/coins/markets"
     params = {
         "vs_currency": "usd",
         "order": "market_cap_desc",
         "sparkline": "false",
         "price_change_percentage": "1h,24h",
-        "page": page,
+        "per_page": top_n or 50,
+        "page": 1,
     }
-
     if category:
         params["category"] = category
-
-    if ids:
-        params["ids"] = ",".join(ids)
-        params["per_page"] = len(ids)
-    else:
-        params["per_page"] = top_n or 50
 
     r = requests.get(url, params=params, timeout=30)
     r.raise_for_status()
     return r.json()
 
-def fetch_ohlc(coin_id):
-    url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/ohlc"
-    r = requests.get(url, params={"vs_currency": "usd", "days": 1}, timeout=30)
-    r.raise_for_status()
-    return r.json()
+def fetch_ohlc_cached(coin_id, cache):
+    if coin_id not in cache:
+        cache[coin_id] = requests.get(
+            f"https://api.coingecko.com/api/v3/coins/{coin_id}/ohlc",
+            params={"vs_currency": "usd", "days": 1},
+            timeout=30
+        ).json()
+    return cache[coin_id]
 
 # ======================
 # LOGIC
@@ -130,8 +136,8 @@ def should_alert(symbol, side, cooldown):
 def score(conf24, conf1h):
     return min(100, int(abs(conf24) * 6 + abs(conf1h) * 30))
 
-def build_levels(coin_id, entry, side):
-    ohlc = fetch_ohlc(coin_id)
+def build_levels(coin_id, entry, side, ohlc_cache):
+    ohlc = fetch_ohlc_cached(coin_id, ohlc_cache)
     highs = [x[2] for x in ohlc]
     lows = [x[3] for x in ohlc]
 
@@ -144,86 +150,90 @@ def build_levels(coin_id, entry, side):
         risk = sl - entry
         return sl, entry - risk, entry - 2 * risk, entry - 3 * risk
 
-def fmt(p):
-    return f"${p:,.6f}" if p < 1 else f"${p:,.2f}"
-
 def format_msg(cat, sym, side, entry, sl, tp1, tp2, tp3, conf, chg1h, chg24, time_str):
-    emoji = "🔥🚀💰" if cat == "MEME" else "🚨💎"
-    arrow = "🟢📈" if side == "BUY" else "🔴📉"
-
     return (
-        f"{emoji} *{sym} {side} SIGNAL* {emoji}\n"
-        f"{arrow} *Action:* {side}\n"
-        f"━━━━━━━━━━━━━━\n"
-        f"🎯 *Entry:* {fmt(entry)}\n"
-        f"🛑 *Stop Loss:* {fmt(sl)}\n"
-        f"✅ *TP1:* {fmt(tp1)}\n"
-        f"✅ *TP2:* {fmt(tp2)}\n"
-        f"✅ *TP3:* {fmt(tp3)}\n"
-        f"━━━━━━━━━━━━━━\n"
-        f"⚡ 1h: {chg1h:+.2f}% | 24h: {chg24:+.2f}%\n"
-        f"🧠 *Confidence:* {conf}/100\n"
-        f"⏰ {time_str}\n"
-        f"_Not financial advice_"
+        f"🚀 *{sym} {side} SIGNAL*\n"
+        f"Entry: ${entry:.4f}\n"
+        f"SL: ${sl:.4f}\n"
+        f"TP1: ${tp1:.4f}\n"
+        f"TP2: ${tp2:.4f}\n"
+        f"TP3: ${tp3:.4f}\n"
+        f"1h: {chg1h:+.2f}% | 24h: {chg24:+.2f}%\n"
+        f"Confidence: {conf}/100\n"
+        f"{time_str}"
     )
 
 # ======================
-# MAIN LOOP
+# SCAN FUNCTION (reusable)
+# ======================
+def run_scan(conn):
+    alerts = []
+    ohlc_cache = {}
+    now = datetime.now(timezone.utc).strftime("%H:%M UTC")
+
+    majors = fetch_markets(MAJORS_TOP_N)
+    memes = fetch_markets(MEMES_TOP_N, MEME_CATEGORY)
+
+    for group, data, min24, min1h, cd in [
+        ("MAJOR", majors, MAJOR_MIN_24H, MAJOR_MIN_1H, MAJOR_COOLDOWN),
+        ("MEME", memes, MEME_MIN_24H, MEME_MIN_1H, MEME_COOLDOWN),
+    ]:
+        for c in data:
+            chg1h = c.get("price_change_percentage_1h_in_currency")
+            chg24 = c.get("price_change_percentage_24h")
+            if chg1h is None or chg24 is None:
+                continue
+
+            side = "BUY" if chg24 > min24 and chg1h > min1h else \
+                   "SELL" if chg24 < -min24 and chg1h < -min1h else None
+            if not side or not should_alert(c["symbol"], side, cd):
+                continue
+
+            entry = c["current_price"]
+            sl, tp1, tp2, tp3 = build_levels(c["id"], entry, side, ohlc_cache)
+            conf = score(chg24, chg1h)
+
+            alerts.append(format_msg(group, c["symbol"].upper(), side, entry, sl, tp1, tp2, tp3, conf, chg1h, chg24, now))
+
+            if len(alerts) >= MAX_ALERTS_PER_LOOP:
+                break
+
+    return alerts
+
+# ======================
+# MAIN LOOP + COMMANDS
 # ======================
 def main():
     conn = db_connect()
-    send_message("📊✅ *Tracking Enabled!* Signals are now logged to PostgreSQL 🚀")
+    send_message("✅ Bot online. Auto scans every 15 minutes.\nType /help for commands.")
+    offset = None
 
     while True:
         try:
-            now = datetime.now(timezone.utc).strftime("%H:%M UTC")
-            alerts = []
-
-            majors = fetch_markets(top_n=MAJORS_TOP_N)
-            memes = fetch_markets(top_n=MEMES_TOP_N, category=MEME_CATEGORY)
-
-            for group, data, min24, min1h, cd in [
-                ("MAJOR", majors, MAJOR_MIN_24H, MAJOR_MIN_1H, MAJOR_COOLDOWN),
-                ("MEME", memes, MEME_MIN_24H, MEME_MIN_1H, MEME_COOLDOWN),
-            ]:
-                for c in data:
-                    sym = c["symbol"].upper()
-                    chg1h = c.get("price_change_percentage_1h_in_currency")
-                    chg24 = c.get("price_change_percentage_24h")
-
-                    if chg1h is None or chg24 is None:
-                        continue
-
-                    side = "BUY" if chg24 > min24 and chg1h > min1h else \
-                           "SELL" if chg24 < -min24 and chg1h < -min1h else None
-                    if not side:
-                        continue
-                    if not should_alert(sym, side, cd):
-                        continue
-
-                    entry = float(c["current_price"])
-                    sl, tp1, tp2, tp3 = build_levels(c["id"], entry, side)
-                    conf = score(chg24, chg1h)
-
-                    db_insert(conn, (
-                        datetime.now(timezone.utc).isoformat(),
-                        group, sym, c["id"], side,
-                        entry, sl, tp1, tp2, tp3,
-                        conf, chg1h, chg24
-                    ))
-
-                    alerts.append(format_msg(group, sym, side, entry, sl, tp1, tp2, tp3, conf, chg1h, chg24, now))
-
-                    # Stop early to avoid extra API calls once we have enough alerts
-                    if len(alerts) >= MAX_ALERTS_PER_LOOP:
-                        break
-
-                # Stop scanning the next group if we've hit the max
-                if len(alerts) >= MAX_ALERTS_PER_LOOP:
-                    break
-
+            # Auto scan
+            alerts = run_scan(conn)
             if alerts:
-                send_message("🚨🔥 *NEW TRADE SETUPS* 🔥🚨\n\n" + "\n\n".join(alerts[:MAX_ALERTS_PER_LOOP]))
+                send_message("🔥 *NEW SIGNALS*\n\n" + "\n\n".join(alerts))
+
+            # Commands
+            updates = get_updates(offset)
+            for u in updates:
+                offset = u["update_id"] + 1
+                if "message" not in u:
+                    continue
+                text = u["message"].get("text", "")
+
+                if text == "/signals":
+                    send_message("🔍 Running manual scan...")
+                    alerts = run_scan(conn)
+                    send_message("\n\n".join(alerts) if alerts else "No signals right now.")
+
+                elif text == "/status":
+                    uptime = int((time.time() - BOT_START_TIME) / 60)
+                    send_message(f"🟢 Bot running\nUptime: {uptime} minutes\nMajors: 50 | Memes: 50")
+
+                elif text == "/help":
+                    send_message("/signals – run scan now\n/status – bot status\n/help – commands")
 
         except Exception as e:
             print("Error:", e)
