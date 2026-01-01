@@ -33,7 +33,6 @@ MEME_COOLDOWN = 2 * 60 * 60
 last_alert_time = {}
 
 MEME_CATEGORY = "meme-token"
-
 BOT_START_TIME = time.time()
 
 # ======================
@@ -63,15 +62,6 @@ def db_connect():
     conn.commit()
     return conn
 
-def db_insert(conn, data):
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO signals
-        (ts_utc, category, symbol, coin_id, side, entry, stop_loss, tp1, tp2, tp3, confidence, chg1h, chg24)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-    """, data)
-    conn.commit()
-
 # ======================
 # TELEGRAM
 # ======================
@@ -83,15 +73,6 @@ def send_message(text):
         "parse_mode": "Markdown"
     }
     requests.post(url, json=payload, timeout=20)
-
-def get_updates(offset=None):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
-    params = {"timeout": 30}
-    if offset:
-        params["offset"] = offset
-    r = requests.get(url, params=params, timeout=30)
-    r.raise_for_status()
-    return r.json()["result"]
 
 # ======================
 # MARKET DATA
@@ -124,9 +105,7 @@ def fetch_ohlc_cached(coin_id, cache):
         cache[coin_id] = r.json()
         return cache[coin_id]
     except requests.exceptions.HTTPError as e:
-        # If rate-limited, skip OHLC for this coin this loop
         if getattr(e.response, "status_code", None) == 429:
-            print(f"Rate limited (429) on OHLC for {coin_id} — skipping this coin this loop.")
             cache[coin_id] = None
             return None
         raise
@@ -162,21 +141,34 @@ def build_levels(coin_id, entry, side, ohlc_cache):
         risk = sl - entry
         return sl, entry - risk, entry - 2 * risk, entry - 3 * risk
 
+# ======================
+# ⭐ IMPROVED SIGNAL FORMAT ⭐
+# ======================
 def format_msg(cat, sym, side, entry, sl, tp1, tp2, tp3, conf, chg1h, chg24, time_str):
+    market = "🧊 *MAJOR*" if cat == "MAJOR" else "🐸 *MEME*"
+    action = "🟢 *BUY*" if side == "BUY" else "🔴 *SELL*"
+
+    def fmt(p):
+        return f"${p:,.6f}" if p < 1 else f"${p:,.2f}"
+
     return (
-        f"🚀 *{sym} {side} SIGNAL*\n"
-        f"Entry: ${entry:.4f}\n"
-        f"SL: ${sl:.4f}\n"
-        f"TP1: ${tp1:.4f}\n"
-        f"TP2: ${tp2:.4f}\n"
-        f"TP3: ${tp3:.4f}\n"
-        f"1h: {chg1h:+.2f}% | 24h: {chg24:+.2f}%\n"
-        f"Confidence: {conf}/100\n"
-        f"{time_str}"
+        f"🚨 *TRADE SIGNAL* 🚨\n"
+        f"{market} | *{sym}*\n"
+        f"{action} • *Confidence:* {conf}/100\n"
+        f"⏰ *Time:* {time_str}\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"🎯 *Entry:* `{fmt(entry)}`\n"
+        f"🛑 *Stop Loss:* `{fmt(sl)}`\n"
+        f"✅ *TP1:* `{fmt(tp1)}`\n"
+        f"✅ *TP2:* `{fmt(tp2)}`\n"
+        f"✅ *TP3:* `{fmt(tp3)}`\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"📈 *Momentum:* 1h `{chg1h:+.2f}%` | 24h `{chg24:+.2f}%`\n"
+        f"_Not financial advice_"
     )
 
 # ======================
-# SCAN FUNCTION (reusable)
+# SCAN FUNCTION
 # ======================
 def run_scan(conn):
     alerts = []
@@ -209,7 +201,9 @@ def run_scan(conn):
             sl, tp1, tp2, tp3 = levels
             conf = score(chg24, chg1h)
 
-            alerts.append(format_msg(group, c["symbol"].upper(), side, entry, sl, tp1, tp2, tp3, conf, chg1h, chg24, now))
+            alerts.append(
+                format_msg(group, c["symbol"].upper(), side, entry, sl, tp1, tp2, tp3, conf, chg1h, chg24, now)
+            )
 
             if len(alerts) >= MAX_ALERTS_PER_LOOP:
                 break
@@ -217,52 +211,17 @@ def run_scan(conn):
     return alerts
 
 # ======================
-# MAIN LOOP + COMMANDS
+# MAIN LOOP
 # ======================
 def main():
     conn = db_connect()
     send_message("✅ Bot online. Auto scans every 15 minutes.\nType /help for commands.")
-    offset = None
 
     while True:
         try:
-            # Auto scan
             alerts = run_scan(conn)
             if alerts:
-                send_message("🔥 *NEW SIGNALS*\n\n" + "\n\n".join(alerts))
-
-            # Commands
-            updates = get_updates(offset)
-            for u in updates:
-                offset = u.get("update_id", 0) + 1
-
-                msg = u.get("message")
-                if not msg:
-                    continue
-
-                # Ignore Telegram service/system messages and bot messages
-                sender = msg.get("from")
-                if not sender:
-                    continue
-                if sender.get("is_bot"):
-                    continue
-
-                text = (msg.get("text") or "").strip()
-                if not text.startswith("/"):
-                    continue
-
-                if text == "/signals":
-                    send_message("🔍 Running manual scan...")
-                    alerts = run_scan(conn)
-                    send_message("\n\n".join(alerts) if alerts else "No signals right now.")
-
-                elif text == "/status":
-                    uptime = int((time.time() - BOT_START_TIME) / 60)
-                    send_message(f"🟢 Bot running\nUptime: {uptime} minutes\nMajors: 50 | Memes: 50")
-
-                elif text == "/help":
-                    send_message("/signals – run scan now\n/status – bot status\n/help – commands")
-
+                send_message("🔥 *NEW TRADE SETUPS*\n━━━━━━━━━━━━━━\n\n" + "\n\n".join(alerts))
         except Exception as e:
             print("Error:", e)
 
