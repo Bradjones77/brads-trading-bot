@@ -15,21 +15,23 @@ if not BOT_TOKEN or not CHAT_ID or not DATABASE_URL:
     raise RuntimeError("BOT_TOKEN, CHAT_ID, or DATABASE_URL missing")
 
 # ======================
-# SETTINGS
+# SETTINGS (BALANCED – MORE SIGNALS)
 # ======================
-CHECK_EVERY_SECONDS = 900  # 15 minutes
+CHECK_EVERY_SECONDS = 600  # 10 minutes
 MAJORS_TOP_N = 50
 MEMES_TOP_N = 50
-MAX_ALERTS_PER_LOOP = 6
+MAX_ALERTS_PER_LOOP = 10
 
-MAJOR_MIN_24H = 2.0
-MAJOR_MIN_1H = 0.6
+# Easier thresholds = more signals
+MAJOR_MIN_24H = 1.5
+MAJOR_MIN_1H = 0.4
 
-MEME_MIN_24H = 4.0
-MEME_MIN_1H = 1.2
+MEME_MIN_24H = 3.0
+MEME_MIN_1H = 0.8
 
-MAJOR_COOLDOWN = 60 * 60
-MEME_COOLDOWN = 2 * 60 * 60
+# Shorter cooldowns
+MAJOR_COOLDOWN = 30 * 60      # 30 minutes
+MEME_COOLDOWN = 60 * 60       # 1 hour
 last_alert_time = {}
 
 MEME_CATEGORY = "meme-token"
@@ -142,7 +144,7 @@ def build_levels(coin_id, entry, side, ohlc_cache):
         return sl, entry - risk, entry - 2 * risk, entry - 3 * risk
 
 # ======================
-# ⭐ IMPROVED SIGNAL FORMAT ⭐
+# ⭐ SIGNAL FORMAT ⭐
 # ======================
 def format_msg(cat, sym, side, entry, sl, tp1, tp2, tp3, conf, chg1h, chg24, time_str):
     market = "🧊 *MAJOR*" if cat == "MAJOR" else "🐸 *MEME*"
@@ -215,7 +217,7 @@ def run_scan(conn):
 # ======================
 def main():
     conn = db_connect()
-    send_message("✅ Bot online. Auto scans every 15 minutes.\nType /help for commands.")
+    send_message("✅ Bot online. Auto scans every 10 minutes.\nBalanced mode enabled.")
 
     while True:
         try:
