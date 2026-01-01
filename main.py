@@ -114,13 +114,22 @@ def fetch_markets(top_n=None, category=None):
     return r.json()
 
 def fetch_ohlc_cached(coin_id, cache):
-    if coin_id not in cache:
-        cache[coin_id] = requests.get(
-            f"https://api.coingecko.com/api/v3/coins/{coin_id}/ohlc",
-            params={"vs_currency": "usd", "days": 1},
-            timeout=30
-        ).json()
-    return cache[coin_id]
+    if coin_id in cache:
+        return cache[coin_id]
+
+    url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/ohlc"
+    try:
+        r = requests.get(url, params={"vs_currency": "usd", "days": 1}, timeout=30)
+        r.raise_for_status()
+        cache[coin_id] = r.json()
+        return cache[coin_id]
+    except requests.exceptions.HTTPError as e:
+        # If rate-limited, skip OHLC for this coin this loop
+        if getattr(e.response, "status_code", None) == 429:
+            print(f"Rate limited (429) on OHLC for {coin_id} — skipping this coin this loop.")
+            cache[coin_id] = None
+            return None
+        raise
 
 # ======================
 # LOGIC
@@ -138,6 +147,9 @@ def score(conf24, conf1h):
 
 def build_levels(coin_id, entry, side, ohlc_cache):
     ohlc = fetch_ohlc_cached(coin_id, ohlc_cache)
+    if not ohlc:
+        return None
+
     highs = [x[2] for x in ohlc]
     lows = [x[3] for x in ohlc]
 
@@ -190,7 +202,11 @@ def run_scan(conn):
                 continue
 
             entry = c["current_price"]
-            sl, tp1, tp2, tp3 = build_levels(c["id"], entry, side, ohlc_cache)
+            levels = build_levels(c["id"], entry, side, ohlc_cache)
+            if not levels:
+                continue
+
+            sl, tp1, tp2, tp3 = levels
             conf = score(chg24, chg1h)
 
             alerts.append(format_msg(group, c["symbol"].upper(), side, entry, sl, tp1, tp2, tp3, conf, chg1h, chg24, now))
@@ -218,10 +234,22 @@ def main():
             # Commands
             updates = get_updates(offset)
             for u in updates:
-                offset = u["update_id"] + 1
-                if "message" not in u:
+                offset = u.get("update_id", 0) + 1
+
+                msg = u.get("message")
+                if not msg:
                     continue
-                text = u["message"].get("text", "")
+
+                # Ignore Telegram service/system messages and bot messages
+                sender = msg.get("from")
+                if not sender:
+                    continue
+                if sender.get("is_bot"):
+                    continue
+
+                text = (msg.get("text") or "").strip()
+                if not text.startswith("/"):
+                    continue
 
                 if text == "/signals":
                     send_message("🔍 Running manual scan...")
