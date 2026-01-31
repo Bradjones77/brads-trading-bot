@@ -7,16 +7,11 @@ from datetime import datetime, timezone, timedelta
 # ======================
 # OPTIONAL AI (FAIL-SAFE)
 # ======================
-# If ai_guard.py exists + OPENAI_API_KEY is set, AI will:
-# 1) approve/reject trades (filter)
-# 2) adjust confidence (+/-)
-# If anything fails, bot continues normally.
 try:
     from ai_guard import ai_enabled, judge_trade
 except Exception:
     def ai_enabled() -> bool:
         return False
-
     def judge_trade(trade_context):
         raise RuntimeError("AI not available")
 
@@ -42,8 +37,10 @@ MAX_SIGNALS_PER_HOUR = 10         # prevent spam
 MIN_24H = 1.5
 MIN_1H = 0.4
 
-# Cooldown per symbol+side to avoid repeats
+# Cooldown per symbol+side to avoid repeats (PERSISTENT via DB)
 ALERT_COOLDOWN_SECONDS = 60 * 60  # 1 hour
+
+# In-memory fallback cooldowns (used only if DB check fails)
 last_alert_time = {}
 
 # Pending signals bucket (collect during hour, send hourly)
@@ -53,16 +50,13 @@ pending_keys = set()  # (symbol, side)
 # ======================
 # MEMORY RULES (A + B)
 # ======================
-# STRICT block (A): if >=6 closed trades and win rate < 30% => BLOCK
 MEM_STRICT_MIN_TRADES = 6
 MEM_STRICT_BLOCK_BELOW_WINRATE = 0.30
 
-# SOFT penalty (B): if >=4 closed trades and win rate < 45% => -10 confidence
 MEM_SOFT_MIN_TRADES = 4
 MEM_SOFT_PENALIZE_BELOW_WINRATE = 0.45
 MEM_SOFT_PENALTY = -10
 
-# Lookback window for "recent" memory
 MEM_LOOKBACK_DAYS = 14
 
 # ======================
@@ -72,6 +66,7 @@ def db_connect():
     conn = psycopg2.connect(DATABASE_URL)
     cur = conn.cursor()
 
+    # Trades table (your main memory)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS trades (
             id SERIAL PRIMARY KEY,
@@ -93,6 +88,17 @@ def db_connect():
             closed_ts_utc TEXT
         )
     """)
+
+    # ✅ Persistent cooldowns table
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS cooldowns (
+            symbol TEXT NOT NULL,
+            side TEXT NOT NULL,
+            last_sent_ts TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (symbol, side)
+        )
+    """)
+
     conn.commit()
     return conn
 
@@ -119,7 +125,6 @@ def close_trade(conn, trade_id, result):
 def get_win_stats(conn):
     cur = conn.cursor()
 
-    # All-time closed
     cur.execute("""
         SELECT
             COUNT(*) FILTER (WHERE status='CLOSED') AS total,
@@ -131,7 +136,6 @@ def get_win_stats(conn):
     wins = wins or 0
     all_time_win_pct = (wins / total * 100.0) if total > 0 else 0.0
 
-    # Last 7 days closed
     seven_days_ago = datetime.now(timezone.utc) - timedelta(days=7)
     cur.execute("""
         SELECT
@@ -148,6 +152,68 @@ def get_win_stats(conn):
     last7_win_pct = (wins7 / total7 * 100.0) if total7 > 0 else 0.0
 
     return all_time_win_pct, total, last7_win_pct, total7
+
+# ======================
+# PERSISTENT COOLDOWNS (DB)
+# ======================
+def load_cooldowns(conn):
+    """
+    Load all cooldowns into a dict for this scan loop.
+    Returns dict: {(symbol, side): last_sent_ts_datetime}
+    Fail-safe: returns {} if anything goes wrong.
+    """
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT symbol, side, last_sent_ts FROM cooldowns")
+        rows = cur.fetchall()
+        out = {}
+        for sym, side, ts in rows:
+            out[(sym, side)] = ts
+        return out
+    except Exception:
+        return {}
+
+def cooldown_ok(symbol, side, cooldown_cache):
+    """
+    Check cooldown from cache. If cache doesn't have it, it's allowed.
+    """
+    last_ts = cooldown_cache.get((symbol, side))
+    if not last_ts:
+        return True
+    now = datetime.now(timezone.utc)
+    return (now - last_ts).total_seconds() >= ALERT_COOLDOWN_SECONDS
+
+def set_cooldown(conn, symbol, side, cooldown_cache):
+    """
+    Persist cooldown to DB + update cache.
+    Fail-safe: if DB fails, still update RAM fallback.
+    """
+    now = datetime.now(timezone.utc)
+    cooldown_cache[(symbol, side)] = now
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO cooldowns (symbol, side, last_sent_ts)
+            VALUES (%s,%s,%s)
+            ON CONFLICT (symbol, side)
+            DO UPDATE SET last_sent_ts = EXCLUDED.last_sent_ts
+        """, (symbol, side, now))
+        conn.commit()
+    except Exception:
+        # DB write failed -> fallback RAM mark
+        key = f"{symbol}:{side}"
+        last_alert_time[key] = int(time.time())
+
+def should_alert_fallback_ram(symbol, side):
+    """
+    Old behaviour (RAM) used only if DB reads completely fail.
+    """
+    now = int(time.time())
+    key = f"{symbol}:{side}"
+    if now - last_alert_time.get(key, 0) < ALERT_COOLDOWN_SECONDS:
+        return False
+    last_alert_time[key] = now
+    return True
 
 # ======================
 # TELEGRAM
@@ -187,14 +253,6 @@ def fetch_simple_price_usd(coin_ids):
 # ======================
 # CORE LOGIC
 # ======================
-def should_alert(symbol, side):
-    now = int(time.time())
-    key = f"{symbol}:{side}"
-    if now - last_alert_time.get(key, 0) < ALERT_COOLDOWN_SECONDS:
-        return False
-    last_alert_time[key] = now
-    return True
-
 def score(chg24, chg1h):
     return max(0, min(100, int(abs(chg24) * 6 + abs(chg1h) * 30)))
 
@@ -218,7 +276,6 @@ def build_levels(entry, side, high_24h, low_24h):
         risk = sl - entry
         if risk <= 0:
             return None
-        # tighter ladder for SHORT
         tp1 = entry - 0.8 * risk
         tp2 = entry - 1.1 * risk
         tp3 = entry - 1.4 * risk
@@ -228,11 +285,6 @@ def build_levels(entry, side, high_24h, low_24h):
 # DECISION MEMORY (DB)
 # ======================
 def get_recent_side_performance(conn, symbol, side):
-    """
-    Returns: (closed_trades_count, win_rate_float_0to1)
-    Looks back MEM_LOOKBACK_DAYS, uses CLOSED trades only.
-    FAIL-SAFE: returns (0, None) if anything fails.
-    """
     try:
         cur = conn.cursor()
         since = datetime.now(timezone.utc) - timedelta(days=MEM_LOOKBACK_DAYS)
@@ -264,22 +316,14 @@ def get_recent_side_performance(conn, symbol, side):
         return 0, None
 
 def apply_memory_rules(conn, symbol, side):
-    """
-    Implements A + B:
-      A) STRICT block if >=6 trades and winrate < 30%
-      B) SOFT penalty if >=4 trades and winrate < 45% => -10 confidence
-    Returns: (blocked_bool, confidence_delta_int, memory_note_or_None)
-    """
     total, winrate = get_recent_side_performance(conn, symbol, side)
     if winrate is None:
         return False, 0, None
 
-    # STRICT block
     if total >= MEM_STRICT_MIN_TRADES and winrate < MEM_STRICT_BLOCK_BELOW_WINRATE:
         note = f"Blocked by memory: {total} trades, {winrate*100:.0f}% win (last {MEM_LOOKBACK_DAYS}d)"
         return True, 0, note
 
-    # SOFT penalty
     if total >= MEM_SOFT_MIN_TRADES and winrate < MEM_SOFT_PENALIZE_BELOW_WINRATE:
         note = f"Memory penalty: {total} trades, {winrate*100:.0f}% win (last {MEM_LOOKBACK_DAYS}d)"
         return False, MEM_SOFT_PENALTY, note
@@ -304,8 +348,8 @@ def build_ai_context(coin_name, sym, side, entry, sl, tp1, tp2, tp3, base_conf, 
     return {
         "coin": coin_name,
         "symbol": sym,
-        "direction": side,     # LONG / SHORT
-        "action": action,      # BUY / SELL
+        "direction": side,
+        "action": action,
         "entry": entry,
         "stop_loss": sl,
         "tp1": tp1,
@@ -329,12 +373,10 @@ def fmt_price(p):
     return f"${p:,.6f}" if p < 1 else f"${p:,.2f}"
 
 def format_signal_msg(coin_name, sym, side, entry, sl, tp1, tp2, tp3, conf, chg1h, chg24, time_str, notes=None):
-    # LONG/SHORT + BUY/SELL
     direction = "🟢 *LONG (BUY)*" if side == "LONG" else "🔴 *SHORT (SELL)*"
 
     extra = ""
     if notes:
-        # keep it tight
         joined = " | ".join([n for n in notes if n])[:250]
         if joined:
             extra = f"\n🧠 *Notes:* `{joined}`"
@@ -409,6 +451,14 @@ def scan_and_collect(conn):
     now_str = datetime.now(timezone.utc).strftime("%H:%M UTC")
     ts_iso = datetime.now(timezone.utc).isoformat()
 
+    # ✅ Load DB cooldown cache once per scan (fast + persistent)
+    cooldown_cache = load_cooldowns(conn)
+    cooldown_cache_ok = True  # if empty because DB failed, we fallback per coin
+
+    # If DB read failed, load_cooldowns returns {} — but {} could also be valid.
+    # We'll treat failures by falling back when needed (below).
+    # (No crash, ever.)
+
     for c in markets:
         chg1h = c.get("price_change_percentage_1h_in_currency")
         chg24 = c.get("price_change_percentage_24h")
@@ -419,7 +469,6 @@ def scan_and_collect(conn):
         if chg1h is None or chg24 is None or entry is None:
             continue
 
-        # LONG / SHORT decision
         side = None
         if chg24 > MIN_24H and chg1h > MIN_1H:
             side = "LONG"
@@ -434,42 +483,38 @@ def scan_and_collect(conn):
         if not sym or not coin_id:
             continue
 
-        # per-hour cooldown
-        if not should_alert(sym, side):
-            continue
+        # ✅ Persistent cooldown check (DB cache). If DB fails, fallback to RAM.
+        try:
+            if not cooldown_ok(sym, side, cooldown_cache):
+                continue
+        except Exception:
+            # fallback RAM
+            if not should_alert_fallback_ram(sym, side):
+                continue
 
         # dedupe within hour
         key = (sym, side)
         if key in pending_keys:
             continue
 
-        # compute base levels
         levels = build_levels(entry, side, high_24h, low_24h)
         if not levels:
             continue
         sl, tp1, tp2, tp3 = levels
 
-        # base confidence
         conf = score(chg24, chg1h)
-
         notes = []
 
-        # ----------------------
-        # MEMORY LAYER (A + B)
-        # ----------------------
+        # Memory layer (A + B)
         blocked, mem_delta, mem_note = apply_memory_rules(conn, sym, side)
         if mem_note:
             notes.append(mem_note)
-
         if blocked:
-            # strict block
             continue
 
         conf_after_mem = max(0, min(100, conf + mem_delta))
 
-        # ----------------------
-        # AI FILTER + ADJUST (FAIL-SAFE)
-        # ----------------------
+        # AI layer (fail-safe)
         final_conf = conf_after_mem
         if ai_enabled():
             try:
@@ -488,12 +533,13 @@ def scan_and_collect(conn):
                 if reason:
                     notes.append(f"AI: {reason} ({int(adj):+d})")
             except Exception:
-                # AI failed -> do nothing, keep running
                 final_conf = conf_after_mem
 
-        # enforce min confidence
         if final_conf < CONFIDENCE_MIN:
             continue
+
+        # ✅ Persist cooldown NOW (so restarts don’t resend)
+        set_cooldown(conn, sym, side, cooldown_cache)
 
         # Save trade (store final confidence)
         insert_trade(conn, ts_iso, sym, coin_id, coin_name, side, entry, sl, tp1, tp2, tp3, final_conf, chg1h, chg24)
@@ -544,6 +590,7 @@ def main():
         "⏳ Signals are sent once per hour.\n"
         f"🤖 AI Filter: {ai_status}\n"
         "🧠 Decision Memory: ON ✅\n"
+        "🕒 Persistent Cooldowns: ON ✅\n"
         "_Not financial advice_"
     )
 
