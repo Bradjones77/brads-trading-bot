@@ -5,6 +5,22 @@ import psycopg2
 from datetime import datetime, timezone, timedelta
 
 # ======================
+# OPTIONAL AI (FAIL-SAFE)
+# ======================
+# If ai_guard.py exists + OPENAI_API_KEY is set, AI will:
+# 1) approve/reject trades (filter)
+# 2) adjust confidence (+/-)
+# If anything fails, bot continues normally.
+try:
+    from ai_guard import ai_enabled, judge_trade
+except Exception:
+    def ai_enabled() -> bool:
+        return False
+
+    def judge_trade(trade_context):
+        raise RuntimeError("AI not available")
+
+# ======================
 # ENVIRONMENT VARIABLES
 # ======================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -206,7 +222,6 @@ def build_levels(entry, side, high_24h, low_24h):
     if entry is None or high_24h is None or low_24h is None:
         return None
 
-    # Basic sanity
     if low_24h <= 0 or high_24h <= 0:
         return None
 
@@ -215,7 +230,6 @@ def build_levels(entry, side, high_24h, low_24h):
         risk = entry - sl
         if risk <= 0:
             return None
-        # Wider targets for LONG
         tp1 = entry + 1.0 * risk
         tp2 = entry + 2.0 * risk
         tp3 = entry + 3.0 * risk
@@ -226,11 +240,46 @@ def build_levels(entry, side, high_24h, low_24h):
         risk = sl - entry
         if risk <= 0:
             return None
-        # Closer targets for SHORT
         tp1 = entry - 0.8 * risk
         tp2 = entry - 1.1 * risk
         tp3 = entry - 1.4 * risk
         return sl, tp1, tp2, tp3
+
+# ======================
+# AI CONTEXT (BUY/SELL + LONG/SHORT)
+# ======================
+def build_ai_context(coin_name, sym, side, entry, sl, tp1, tp2, tp3, base_conf, chg1h, chg24):
+    """
+    side is LONG/SHORT in this bot.
+    We also provide BUY/SELL mapping for your messages & AI.
+    """
+    action = "BUY" if side == "LONG" else "SELL"
+
+    rr_tp1 = None
+    try:
+        if side == "LONG":
+            rr_tp1 = (tp1 - entry) / max(1e-12, (entry - sl))
+        else:
+            rr_tp1 = (entry - tp1) / max(1e-12, (sl - entry))
+    except Exception:
+        rr_tp1 = None
+
+    return {
+        "coin": coin_name,
+        "symbol": sym,
+        "direction": side,     # LONG / SHORT
+        "action": action,      # BUY / SELL
+        "entry": entry,
+        "stop_loss": sl,
+        "tp1": tp1,
+        "tp2": tp2,
+        "tp3": tp3,
+        "base_confidence": base_conf,
+        "chg_1h_pct": chg1h,
+        "chg_24h_pct": chg24,
+        "rr_to_tp1": rr_tp1,
+        "note": "SHORT TPs are tighter than LONG TPs by design."
+    }
 
 # ======================
 # MESSAGE FORMAT
@@ -238,8 +287,12 @@ def build_levels(entry, side, high_24h, low_24h):
 def fmt_price(p):
     return f"${p:,.6f}" if p < 1 else f"${p:,.2f}"
 
-def format_signal_msg(coin_name, sym, side, entry, sl, tp1, tp2, tp3, conf, chg1h, chg24, time_str):
-    direction = "🟢 *LONG*" if side == "LONG" else "🔴 *SHORT*"
+def format_signal_msg(coin_name, sym, side, entry, sl, tp1, tp2, tp3, conf, chg1h, chg24, time_str, ai_note=None):
+    # Add BUY/SELL wording
+    action = "BUY" if side == "LONG" else "SELL"
+    direction = "🟢 *LONG (BUY)*" if side == "LONG" else "🔴 *SHORT (SELL)*"
+
+    ai_line = f"\n🤖 *AI:* `{ai_note}`" if ai_note else ""
 
     return (
         f"🚨 *TRADE SIGNAL* 🚨\n"
@@ -254,12 +307,12 @@ def format_signal_msg(coin_name, sym, side, entry, sl, tp1, tp2, tp3, conf, chg1
         f"✅ *TP3:* `{fmt_price(tp3)}`\n"
         f"━━━━━━━━━━━━━━\n"
         f"📈 *Momentum:* 1h `{chg1h:+.2f}%` | 24h `{chg24:+.2f}%`\n"
+        f"{ai_line}\n"
         f"_Not financial advice_"
     )
 
 def format_hourly_header(conn, time_str):
     all_win, all_total, win7, total7 = get_win_stats(conn)
-
     return (
         f"🧠 *Hourly Market Scan* ({time_str})\n"
         f"📊 *Win Rate:* All-time `{all_win:.1f}%` ({all_total} trades) | Last 7D `{win7:.1f}%` ({total7} trades)\n"
@@ -271,10 +324,9 @@ def format_hourly_header(conn, time_str):
 # ======================
 def update_open_trades(conn):
     """
-    Very simple outcome tracker:
-    - WIN if price has crossed TP1 in the correct direction
-    - LOSS if price has crossed SL
-    This is not perfect (no intrabar history), but it gives you a real running win %.
+    Simple outcome tracker:
+    - WIN if price crosses TP1 in the correct direction
+    - LOSS if price crosses SL
     """
     cur = conn.cursor()
     cur.execute("""
@@ -348,28 +400,55 @@ def scan_and_collect(conn):
         if not should_alert(sym, side):
             continue
 
+        # Base confidence
         conf = score(chg24, chg1h)
-        if conf < CONFIDENCE_MIN:
-            continue
 
+        # Levels
         levels = build_levels(entry, side, high_24h, low_24h)
         if not levels:
             continue
-
         sl, tp1, tp2, tp3 = levels
+
+        # ----------------------
+        # AI FILTER + ADJUST (FAIL-SAFE)
+        # ----------------------
+        final_conf = conf
+        ai_note = None
+
+        if ai_enabled():
+            try:
+                ctx = build_ai_context(coin_name, sym, side, entry, sl, tp1, tp2, tp3, conf, chg1h, chg24)
+                approved, adj, reason = judge_trade(ctx)
+
+                # AI can reject trades completely
+                if not approved:
+                    continue
+
+                final_conf = max(0, min(100, conf + int(adj)))
+                # Keep AI note short and clean
+                if reason:
+                    ai_note = f"{reason} ({int(adj):+d})"
+            except Exception:
+                # AI failed -> do NOT break bot, just fallback
+                final_conf = conf
+                ai_note = None
+
+        # Enforce confidence after AI adjustment
+        if final_conf < CONFIDENCE_MIN:
+            continue
 
         # Deduplicate within the hour
         key = (sym, side)
         if key in pending_keys:
             continue
 
-        # Save trade to DB for win tracking
-        insert_trade(conn, ts_iso, sym, coin_id, coin_name, side, entry, sl, tp1, tp2, tp3, conf, chg1h, chg24)
+        # Save trade to DB for win tracking (store final_conf)
+        insert_trade(conn, ts_iso, sym, coin_id, coin_name, side, entry, sl, tp1, tp2, tp3, final_conf, chg1h, chg24)
 
         # Add to pending to be sent on the hour
         pending_keys.add(key)
         pending_signals.append(
-            format_signal_msg(coin_name, sym, side, entry, sl, tp1, tp2, tp3, conf, chg1h, chg24, now_str)
+            format_signal_msg(coin_name, sym, side, entry, sl, tp1, tp2, tp3, final_conf, chg1h, chg24, now_str, ai_note=ai_note)
         )
 
         if len(pending_signals) >= MAX_SIGNALS_PER_HOUR:
@@ -383,7 +462,7 @@ def should_send_now(last_sent_hour):
     Send once per UTC hour.
     """
     now = datetime.now(timezone.utc)
-    hour_key = now.strftime("%Y-%m-%d %H")  # unique per hour
+    hour_key = now.strftime("%Y-%m-%d %H")
     if hour_key != last_sent_hour:
         return True, hour_key
     return False, last_sent_hour
@@ -401,7 +480,6 @@ def send_hourly_update(conn):
     else:
         send_message(f"{header}\n\n❌ *No coins worth investing in.*\n\n_Not financial advice_")
 
-    # Reset bucket for next hour
     pending_signals = []
     pending_keys = set()
 
@@ -410,19 +488,22 @@ def send_hourly_update(conn):
 # ======================
 def main():
     conn = db_connect()
-    send_message("✅ Bot online. Analysing 24/7.\n⏳ Signals are sent once per hour.\n_Not financial advice_")
+
+    ai_status = "ON ✅" if ai_enabled() else "OFF (no OPENAI_API_KEY) ⚠️"
+    send_message(
+        "✅ Bot online. Analysing 24/7.\n"
+        "⏳ Signals are sent once per hour.\n"
+        f"🤖 AI Filter: {ai_status}\n"
+        "_Not financial advice_"
+    )
 
     last_sent_hour = None
 
     while True:
         try:
-            # 1) Update trade outcomes (so win% stays live)
             update_open_trades(conn)
-
-            # 2) Keep analysing (collect signals into hourly bucket)
             scan_and_collect(conn)
 
-            # 3) Send once per hour
             do_send, last_sent_hour = should_send_now(last_sent_hour)
             if do_send:
                 send_hourly_update(conn)
