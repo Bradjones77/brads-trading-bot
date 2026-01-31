@@ -34,24 +34,36 @@ if not BOT_TOKEN or not CHAT_ID or not DATABASE_URL:
 # SETTINGS
 # ======================
 SCAN_EVERY_SECONDS = 600          # 10 minutes (analyse 24/7)
-SEND_ONCE_PER_HOUR = True         # only send Telegram once per hour
 TOP_N_COINS = 150                 # Top 150 only (CoinGecko)
 CONFIDENCE_MIN = 65               # only send signals >= 65 confidence
 MAX_SIGNALS_PER_HOUR = 10         # prevent spam
 
-# Momentum thresholds (tweakable)
+# Momentum thresholds
 MIN_24H = 1.5
 MIN_1H = 0.4
 
-# Cooldown to avoid repeats within same hour per symbol+side
+# Cooldown per symbol+side to avoid repeats
 ALERT_COOLDOWN_SECONDS = 60 * 60  # 1 hour
 last_alert_time = {}
 
-BOT_START_TIME = time.time()
-
-# Pending signals bucket (collect during the hour, send hourly)
+# Pending signals bucket (collect during hour, send hourly)
 pending_signals = []
-pending_keys = set()  # to dedupe signals in the hour: (symbol, side)
+pending_keys = set()  # (symbol, side)
+
+# ======================
+# MEMORY RULES (A + B)
+# ======================
+# STRICT block (A): if >=6 closed trades and win rate < 30% => BLOCK
+MEM_STRICT_MIN_TRADES = 6
+MEM_STRICT_BLOCK_BELOW_WINRATE = 0.30
+
+# SOFT penalty (B): if >=4 closed trades and win rate < 45% => -10 confidence
+MEM_SOFT_MIN_TRADES = 4
+MEM_SOFT_PENALIZE_BELOW_WINRATE = 0.45
+MEM_SOFT_PENALTY = -10
+
+# Lookback window for "recent" memory
+MEM_LOOKBACK_DAYS = 14
 
 # ======================
 # DATABASE
@@ -60,7 +72,6 @@ def db_connect():
     conn = psycopg2.connect(DATABASE_URL)
     cur = conn.cursor()
 
-    # Store each signal as a "trade" to track win/loss later
     cur.execute("""
         CREATE TABLE IF NOT EXISTS trades (
             id SERIAL PRIMARY KEY,
@@ -93,10 +104,19 @@ def insert_trade(conn, ts_utc, symbol, coin_id, coin_name, side, entry, sl, tp1,
     """, (ts_utc, symbol, coin_id, coin_name, side, entry, sl, tp1, tp2, tp3, conf, chg1h, chg24))
     conn.commit()
 
+def close_trade(conn, trade_id, result):
+    cur = conn.cursor()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    cur.execute("""
+        UPDATE trades
+        SET status='CLOSED',
+            result=%s,
+            closed_ts_utc=%s
+        WHERE id=%s
+    """, (result, now_iso, trade_id))
+    conn.commit()
+
 def get_win_stats(conn):
-    """
-    Returns: (all_time_win_pct, all_time_total, last7_win_pct, last7_total)
-    """
     cur = conn.cursor()
 
     # All-time closed
@@ -129,42 +149,18 @@ def get_win_stats(conn):
 
     return all_time_win_pct, total, last7_win_pct, total7
 
-def close_trade(conn, trade_id, result):
-    cur = conn.cursor()
-    now_iso = datetime.now(timezone.utc).isoformat()
-    cur.execute("""
-        UPDATE trades
-        SET status='CLOSED',
-            result=%s,
-            closed_ts_utc=%s
-        WHERE id=%s
-    """, (result, now_iso, trade_id))
-    conn.commit()
-
 # ======================
 # TELEGRAM
 # ======================
 def send_message(text):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": text,
-        "parse_mode": "Markdown"
-    }
+    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}
     requests.post(url, json=payload, timeout=20)
 
 # ======================
 # MARKET DATA (CoinGecko)
 # ======================
 def fetch_top_markets(top_n=150):
-    """
-    Uses /coins/markets which already returns:
-    - current_price
-    - price_change_percentage_1h_in_currency
-    - price_change_percentage_24h
-    - high_24h / low_24h
-    This avoids hammering OHLC endpoint and massively reduces 429 errors.
-    """
     url = "https://api.coingecko.com/api/v3/coins/markets"
     params = {
         "vs_currency": "usd",
@@ -179,24 +175,17 @@ def fetch_top_markets(top_n=150):
     return r.json()
 
 def fetch_simple_price_usd(coin_ids):
-    """
-    For monitoring open trades without hitting heavy endpoints.
-    Returns dict: {coin_id: price_usd}
-    """
     if not coin_ids:
         return {}
     url = "https://api.coingecko.com/api/v3/simple/price"
-    params = {
-        "ids": ",".join(coin_ids),
-        "vs_currencies": "usd"
-    }
+    params = {"ids": ",".join(coin_ids), "vs_currencies": "usd"}
     r = requests.get(url, params=params, timeout=30)
     r.raise_for_status()
     data = r.json()
     return {k: v.get("usd") for k, v in data.items()}
 
 # ======================
-# LOGIC
+# CORE LOGIC
 # ======================
 def should_alert(symbol, side):
     now = int(time.time())
@@ -207,21 +196,11 @@ def should_alert(symbol, side):
     return True
 
 def score(chg24, chg1h):
-    """
-    Your confidence score (0-100). Keep your style but enforce >= 65.
-    """
     return max(0, min(100, int(abs(chg24) * 6 + abs(chg1h) * 30)))
 
 def build_levels(entry, side, high_24h, low_24h):
-    """
-    Uses high_24h/low_24h so we DO NOT call /ohlc (reduces 429 massively).
-    TP spacing rules:
-      - LONG: wider ladder
-      - SHORT: closer together
-    """
     if entry is None or high_24h is None or low_24h is None:
         return None
-
     if low_24h <= 0 or high_24h <= 0:
         return None
 
@@ -234,25 +213,83 @@ def build_levels(entry, side, high_24h, low_24h):
         tp2 = entry + 2.0 * risk
         tp3 = entry + 3.0 * risk
         return sl, tp1, tp2, tp3
-
     else:  # SHORT
         sl = high_24h * 1.003
         risk = sl - entry
         if risk <= 0:
             return None
+        # tighter ladder for SHORT
         tp1 = entry - 0.8 * risk
         tp2 = entry - 1.1 * risk
         tp3 = entry - 1.4 * risk
         return sl, tp1, tp2, tp3
 
 # ======================
-# AI CONTEXT (BUY/SELL + LONG/SHORT)
+# DECISION MEMORY (DB)
 # ======================
-def build_ai_context(coin_name, sym, side, entry, sl, tp1, tp2, tp3, base_conf, chg1h, chg24):
+def get_recent_side_performance(conn, symbol, side):
     """
-    side is LONG/SHORT in this bot.
-    We also provide BUY/SELL mapping for your messages & AI.
+    Returns: (closed_trades_count, win_rate_float_0to1)
+    Looks back MEM_LOOKBACK_DAYS, uses CLOSED trades only.
+    FAIL-SAFE: returns (0, None) if anything fails.
     """
+    try:
+        cur = conn.cursor()
+        since = datetime.now(timezone.utc) - timedelta(days=MEM_LOOKBACK_DAYS)
+
+        cur.execute("""
+            SELECT result
+            FROM trades
+            WHERE status='CLOSED'
+              AND symbol=%s
+              AND side=%s
+              AND closed_ts_utc IS NOT NULL
+              AND closed_ts_utc >= %s
+            ORDER BY closed_ts_utc DESC
+            LIMIT 50
+        """, (symbol, side, since.isoformat()))
+
+        rows = cur.fetchall()
+        if not rows:
+            return 0, None
+
+        results = [r[0] for r in rows if r and r[0] in ("WIN", "LOSS")]
+        if not results:
+            return 0, None
+
+        total = len(results)
+        wins = sum(1 for x in results if x == "WIN")
+        return total, (wins / total) if total > 0 else None
+    except Exception:
+        return 0, None
+
+def apply_memory_rules(conn, symbol, side):
+    """
+    Implements A + B:
+      A) STRICT block if >=6 trades and winrate < 30%
+      B) SOFT penalty if >=4 trades and winrate < 45% => -10 confidence
+    Returns: (blocked_bool, confidence_delta_int, memory_note_or_None)
+    """
+    total, winrate = get_recent_side_performance(conn, symbol, side)
+    if winrate is None:
+        return False, 0, None
+
+    # STRICT block
+    if total >= MEM_STRICT_MIN_TRADES and winrate < MEM_STRICT_BLOCK_BELOW_WINRATE:
+        note = f"Blocked by memory: {total} trades, {winrate*100:.0f}% win (last {MEM_LOOKBACK_DAYS}d)"
+        return True, 0, note
+
+    # SOFT penalty
+    if total >= MEM_SOFT_MIN_TRADES and winrate < MEM_SOFT_PENALIZE_BELOW_WINRATE:
+        note = f"Memory penalty: {total} trades, {winrate*100:.0f}% win (last {MEM_LOOKBACK_DAYS}d)"
+        return False, MEM_SOFT_PENALTY, note
+
+    return False, 0, None
+
+# ======================
+# AI CONTEXT
+# ======================
+def build_ai_context(coin_name, sym, side, entry, sl, tp1, tp2, tp3, base_conf, chg1h, chg24, mem_total=None, mem_winrate=None):
     action = "BUY" if side == "LONG" else "SELL"
 
     rr_tp1 = None
@@ -278,7 +315,11 @@ def build_ai_context(coin_name, sym, side, entry, sl, tp1, tp2, tp3, base_conf, 
         "chg_1h_pct": chg1h,
         "chg_24h_pct": chg24,
         "rr_to_tp1": rr_tp1,
-        "note": "SHORT TPs are tighter than LONG TPs by design."
+        "recent_performance": {
+            "lookback_days": MEM_LOOKBACK_DAYS,
+            "closed_trades": mem_total,
+            "win_rate": mem_winrate
+        }
     }
 
 # ======================
@@ -287,12 +328,16 @@ def build_ai_context(coin_name, sym, side, entry, sl, tp1, tp2, tp3, base_conf, 
 def fmt_price(p):
     return f"${p:,.6f}" if p < 1 else f"${p:,.2f}"
 
-def format_signal_msg(coin_name, sym, side, entry, sl, tp1, tp2, tp3, conf, chg1h, chg24, time_str, ai_note=None):
-    # Add BUY/SELL wording
-    action = "BUY" if side == "LONG" else "SELL"
+def format_signal_msg(coin_name, sym, side, entry, sl, tp1, tp2, tp3, conf, chg1h, chg24, time_str, notes=None):
+    # LONG/SHORT + BUY/SELL
     direction = "🟢 *LONG (BUY)*" if side == "LONG" else "🔴 *SHORT (SELL)*"
 
-    ai_line = f"\n🤖 *AI:* `{ai_note}`" if ai_note else ""
+    extra = ""
+    if notes:
+        # keep it tight
+        joined = " | ".join([n for n in notes if n])[:250]
+        if joined:
+            extra = f"\n🧠 *Notes:* `{joined}`"
 
     return (
         f"🚨 *TRADE SIGNAL* 🚨\n"
@@ -307,7 +352,7 @@ def format_signal_msg(coin_name, sym, side, entry, sl, tp1, tp2, tp3, conf, chg1
         f"✅ *TP3:* `{fmt_price(tp3)}`\n"
         f"━━━━━━━━━━━━━━\n"
         f"📈 *Momentum:* 1h `{chg1h:+.2f}%` | 24h `{chg24:+.2f}%`\n"
-        f"{ai_line}\n"
+        f"{extra}\n"
         f"_Not financial advice_"
     )
 
@@ -323,11 +368,6 @@ def format_hourly_header(conn, time_str):
 # TRADE OUTCOME TRACKING
 # ======================
 def update_open_trades(conn):
-    """
-    Simple outcome tracker:
-    - WIN if price crosses TP1 in the correct direction
-    - LOSS if price crosses SL
-    """
     cur = conn.cursor()
     cur.execute("""
         SELECT id, coin_id, side, stop_loss, tp1
@@ -360,7 +400,7 @@ def update_open_trades(conn):
                 close_trade(conn, trade_id, "WIN")
 
 # ======================
-# SCAN FUNCTION
+# SCAN + COLLECT
 # ======================
 def scan_and_collect(conn):
     global pending_signals, pending_keys
@@ -379,76 +419,89 @@ def scan_and_collect(conn):
         if chg1h is None or chg24 is None or entry is None:
             continue
 
-        # Direction decision (LONG / SHORT)
+        # LONG / SHORT decision
         side = None
         if chg24 > MIN_24H and chg1h > MIN_1H:
             side = "LONG"
         elif chg24 < -MIN_24H and chg1h < -MIN_1H:
             side = "SHORT"
-
         if not side:
             continue
 
         sym = (c.get("symbol") or "").upper()
         coin_id = c.get("id")
         coin_name = c.get("name") or sym
-
         if not sym or not coin_id:
             continue
 
-        # cooldown per symbol+side
+        # per-hour cooldown
         if not should_alert(sym, side):
             continue
 
-        # Base confidence
-        conf = score(chg24, chg1h)
+        # dedupe within hour
+        key = (sym, side)
+        if key in pending_keys:
+            continue
 
-        # Levels
+        # compute base levels
         levels = build_levels(entry, side, high_24h, low_24h)
         if not levels:
             continue
         sl, tp1, tp2, tp3 = levels
 
+        # base confidence
+        conf = score(chg24, chg1h)
+
+        notes = []
+
+        # ----------------------
+        # MEMORY LAYER (A + B)
+        # ----------------------
+        blocked, mem_delta, mem_note = apply_memory_rules(conn, sym, side)
+        if mem_note:
+            notes.append(mem_note)
+
+        if blocked:
+            # strict block
+            continue
+
+        conf_after_mem = max(0, min(100, conf + mem_delta))
+
         # ----------------------
         # AI FILTER + ADJUST (FAIL-SAFE)
         # ----------------------
-        final_conf = conf
-        ai_note = None
-
+        final_conf = conf_after_mem
         if ai_enabled():
             try:
-                ctx = build_ai_context(coin_name, sym, side, entry, sl, tp1, tp2, tp3, conf, chg1h, chg24)
+                mem_total, mem_wr = get_recent_side_performance(conn, sym, side)
+                ctx = build_ai_context(
+                    coin_name, sym, side, entry, sl, tp1, tp2, tp3,
+                    conf_after_mem, chg1h, chg24,
+                    mem_total=mem_total, mem_winrate=mem_wr
+                )
                 approved, adj, reason = judge_trade(ctx)
 
-                # AI can reject trades completely
                 if not approved:
                     continue
 
-                final_conf = max(0, min(100, conf + int(adj)))
-                # Keep AI note short and clean
+                final_conf = max(0, min(100, conf_after_mem + int(adj)))
                 if reason:
-                    ai_note = f"{reason} ({int(adj):+d})"
+                    notes.append(f"AI: {reason} ({int(adj):+d})")
             except Exception:
-                # AI failed -> do NOT break bot, just fallback
-                final_conf = conf
-                ai_note = None
+                # AI failed -> do nothing, keep running
+                final_conf = conf_after_mem
 
-        # Enforce confidence after AI adjustment
+        # enforce min confidence
         if final_conf < CONFIDENCE_MIN:
             continue
 
-        # Deduplicate within the hour
-        key = (sym, side)
-        if key in pending_keys:
-            continue
-
-        # Save trade to DB for win tracking (store final_conf)
+        # Save trade (store final confidence)
         insert_trade(conn, ts_iso, sym, coin_id, coin_name, side, entry, sl, tp1, tp2, tp3, final_conf, chg1h, chg24)
 
-        # Add to pending to be sent on the hour
+        # collect for hourly send
         pending_keys.add(key)
         pending_signals.append(
-            format_signal_msg(coin_name, sym, side, entry, sl, tp1, tp2, tp3, final_conf, chg1h, chg24, now_str, ai_note=ai_note)
+            format_signal_msg(coin_name, sym, side, entry, sl, tp1, tp2, tp3, final_conf, chg1h, chg24, now_str, notes=notes)
         )
 
         if len(pending_signals) >= MAX_SIGNALS_PER_HOUR:
@@ -458,9 +511,6 @@ def scan_and_collect(conn):
 # HOURLY SEND CONTROL
 # ======================
 def should_send_now(last_sent_hour):
-    """
-    Send once per UTC hour.
-    """
     now = datetime.now(timezone.utc)
     hour_key = now.strftime("%Y-%m-%d %H")
     if hour_key != last_sent_hour:
@@ -475,8 +525,7 @@ def send_hourly_update(conn):
 
     if pending_signals:
         body = "\n\n".join(pending_signals)
-        msg = f"{header}\n\n{body}"
-        send_message(msg)
+        send_message(f"{header}\n\n{body}")
     else:
         send_message(f"{header}\n\n❌ *No coins worth investing in.*\n\n_Not financial advice_")
 
@@ -494,6 +543,7 @@ def main():
         "✅ Bot online. Analysing 24/7.\n"
         "⏳ Signals are sent once per hour.\n"
         f"🤖 AI Filter: {ai_status}\n"
+        "🧠 Decision Memory: ON ✅\n"
         "_Not financial advice_"
     )
 
