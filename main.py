@@ -28,7 +28,7 @@ if not BOT_TOKEN or not CHAT_ID or not DATABASE_URL:
 # ======================
 # SETTINGS
 # ======================
-SCAN_EVERY_SECONDS = 600          # 10 minutes (analyse 24/7)
+SCAN_EVERY_SECONDS = 600          # scan every 10 minutes (analyse 24/7)
 TOP_N_COINS = 150                 # Top 150 only (CoinGecko)
 CONFIDENCE_MIN = 65               # only send signals >= 65 confidence
 MAX_SIGNALS_PER_HOUR = 10         # prevent spam
@@ -74,11 +74,170 @@ _last_markets_ts = 0
 OPEN_TRADES_CHECK_EVERY_SECONDS = 30 * 60  # 30 minutes
 _last_open_check_ts = 0
 
-# One requests session (slightly nicer to CoinGecko)
+# One requests session (slightly nicer to APIs)
 SESSION = requests.Session()
 SESSION.headers.update({
-    "User-Agent": "brads-trading-bot/1.0 (signals-only; rate-safe)"
+    "User-Agent": "brads-trading-bot/2.0 (signals-only; rate-safe)"
 })
+
+# ======================
+# BINANCE CANDLE DATA (for realistic ATR + structure)
+# ======================
+BINANCE_TIMEOUT = 10
+BINANCE_MAX_RETRIES = 3
+
+def fetch_binance_klines_usdt(symbol_upper: str, interval="1h", limit=120):
+    """
+    Returns highs, lows, closes arrays from Binance klines using SYMBOLUSDT.
+    Fail-safe: returns (None, None, None) if not available.
+    """
+    pair = f"{symbol_upper}USDT"
+    url = "https://api.binance.com/api/v3/klines"
+    params = {"symbol": pair, "interval": interval, "limit": limit}
+
+    delay = 2
+    for _ in range(BINANCE_MAX_RETRIES):
+        try:
+            r = SESSION.get(url, params=params, timeout=BINANCE_TIMEOUT)
+            if r.status_code in (418, 429):
+                time.sleep(delay)
+                delay = min(delay * 2, 20)
+                continue
+            r.raise_for_status()
+            rows = r.json()
+            highs = [float(x[2]) for x in rows]
+            lows = [float(x[3]) for x in rows]
+            closes = [float(x[4]) for x in rows]
+            if len(closes) < 20:
+                return None, None, None
+            return highs, lows, closes
+        except Exception:
+            time.sleep(delay)
+            delay = min(delay * 2, 20)
+
+    return None, None, None
+
+# ======================
+# ATR + CONSERVATIVE LEVELS
+# ======================
+def _atr(highs, lows, closes, period=14):
+    """
+    Simple ATR calculation (good enough for signal targets).
+    """
+    try:
+        if not highs or not lows or not closes:
+            return None
+        if len(closes) < period + 2:
+            return None
+
+        trs = []
+        for i in range(1, len(closes)):
+            tr = max(
+                highs[i] - lows[i],
+                abs(highs[i] - closes[i-1]),
+                abs(lows[i] - closes[i-1]),
+            )
+            trs.append(tr)
+
+        if len(trs) < period:
+            return None
+        return sum(trs[-period:]) / period
+    except Exception:
+        return None
+
+def build_levels_from_candles(entry, side, highs, lows, closes):
+    """
+    Conservative & realistic targets:
+    - SL beyond structure + ATR padding
+    - TP ladder based on ATR and capped by structure (swing levels)
+    """
+    if entry is None or highs is None or lows is None or closes is None:
+        return None
+
+    atr = _atr(highs, lows, closes, period=14)
+    if atr is None or atr <= 0:
+        return None
+
+    lookback = min(24, len(highs))
+    recent_high = max(highs[-lookback:])
+    recent_low = min(lows[-lookback:])
+
+    if side == "LONG":
+        # SL slightly beyond recent low + small padding
+        sl = min(entry - 1.10 * atr, recent_low - 0.20 * atr)
+
+        tp1 = entry + 0.60 * atr
+        tp2 = entry + 1.00 * atr
+        tp3 = entry + 1.40 * atr
+
+        # Cap near realistic resistance
+        tp1 = min(tp1, recent_high * 0.995)
+        tp2 = min(tp2, recent_high * 1.000)
+        tp3 = min(tp3, recent_high * 1.005)
+
+        if not (sl < entry < tp1 < tp2 < tp3):
+            return None
+        return sl, tp1, tp2, tp3
+
+    else:  # SHORT
+        sl = max(entry + 1.10 * atr, recent_high + 0.20 * atr)
+
+        tp1 = entry - 0.55 * atr
+        tp2 = entry - 0.90 * atr
+        tp3 = entry - 1.25 * atr
+
+        # Cap near realistic support
+        tp1 = max(tp1, recent_low * 1.005)
+        tp2 = max(tp2, recent_low * 1.000)
+        tp3 = max(tp3, recent_low * 0.995)
+
+        if not (tp3 < tp2 < tp1 < entry < sl):
+            return None
+        return sl, tp1, tp2, tp3
+
+def validate_ai_levels(side, entry, atr_value, fallback_levels, ai_levels):
+    """
+    AI kill-switch: accept AI TP/SL only if:
+    - ordering is correct
+    - distances are conservative (ATR-based clamps)
+    Otherwise return fallback.
+    """
+    if not ai_levels:
+        return fallback_levels
+
+    try:
+        sl = float(ai_levels["stop_loss"])
+        tp1 = float(ai_levels["tp1"])
+        tp2 = float(ai_levels["tp2"])
+        tp3 = float(ai_levels["tp3"])
+    except Exception:
+        return fallback_levels
+
+    # If ATR missing, don't accept AI override (keep baseline)
+    if atr_value is None or atr_value <= 0:
+        return fallback_levels
+
+    if side == "LONG":
+        if not (sl < entry < tp1 < tp2 < tp3):
+            return fallback_levels
+        if (tp1 - entry) > 1.2 * atr_value:
+            return fallback_levels
+        if (tp3 - entry) > 2.5 * atr_value:
+            return fallback_levels
+        if (entry - sl) > 1.3 * atr_value:
+            return fallback_levels
+
+    else:  # SHORT
+        if not (tp3 < tp2 < tp1 < entry < sl):
+            return fallback_levels
+        if (entry - tp1) > 1.2 * atr_value:
+            return fallback_levels
+        if (entry - tp3) > 2.5 * atr_value:
+            return fallback_levels
+        if (sl - entry) > 1.3 * atr_value:
+            return fallback_levels
+
+    return (sl, tp1, tp2, tp3)
 
 # ======================
 # DATABASE
@@ -230,11 +389,10 @@ def _get_json_with_backoff(url, params):
     delay = 5
     last_err = None
 
-    for attempt in range(COINGECKO_MAX_RETRIES):
+    for _ in range(COINGECKO_MAX_RETRIES):
         try:
             r = SESSION.get(url, params=params, timeout=COINGECKO_TIMEOUT)
 
-            # Rate limit
             if r.status_code == 429:
                 retry_after = r.headers.get("Retry-After")
                 if retry_after:
@@ -262,7 +420,6 @@ def _get_json_with_backoff(url, params):
 def fetch_top_markets(top_n=150):
     global _last_markets, _last_markets_ts
 
-    # Serve cache if fresh (prevents hammering on restarts and during 429 bursts)
     now = time.time()
     if _last_markets and (now - _last_markets_ts) < MARKETS_CACHE_TTL_SECONDS:
         return _last_markets
@@ -286,7 +443,6 @@ def fetch_simple_price_usd(coin_ids):
     if not coin_ids:
         return {}
 
-    # Basic safety: CoinGecko URLs can get big; keep it reasonable
     coin_ids = list(dict.fromkeys(coin_ids))[:200]
 
     url = "https://api.coingecko.com/api/v3/simple/price"
@@ -300,31 +456,6 @@ def fetch_simple_price_usd(coin_ids):
 # ======================
 def score(chg24, chg1h):
     return max(0, min(100, int(abs(chg24) * 6 + abs(chg1h) * 30)))
-
-def build_levels(entry, side, high_24h, low_24h):
-    if entry is None or high_24h is None or low_24h is None:
-        return None
-    if low_24h <= 0 or high_24h <= 0:
-        return None
-
-    if side == "LONG":
-        sl = low_24h * 0.997
-        risk = entry - sl
-        if risk <= 0:
-            return None
-        tp1 = entry + 1.0 * risk
-        tp2 = entry + 2.0 * risk
-        tp3 = entry + 3.0 * risk
-        return sl, tp1, tp2, tp3
-    else:  # SHORT
-        sl = high_24h * 1.003
-        risk = sl - entry
-        if risk <= 0:
-            return None
-        tp1 = entry - 0.8 * risk
-        tp2 = entry - 1.1 * risk
-        tp3 = entry - 1.4 * risk
-        return sl, tp1, tp2, tp3
 
 # ======================
 # DECISION MEMORY (DB)
@@ -374,7 +505,7 @@ def apply_memory_rules(conn, symbol, side):
 # ======================
 # AI CONTEXT
 # ======================
-def build_ai_context(coin_name, sym, side, entry, sl, tp1, tp2, tp3, base_conf, chg1h, chg24, mem_total=None, mem_winrate=None):
+def build_ai_context(coin_name, sym, side, entry, sl, tp1, tp2, tp3, base_conf, chg1h, chg24, atr_value, mem_total=None, mem_winrate=None):
     action = "BUY" if side == "LONG" else "SELL"
     rr_tp1 = None
     try:
@@ -395,6 +526,7 @@ def build_ai_context(coin_name, sym, side, entry, sl, tp1, tp2, tp3, base_conf, 
         "tp1": tp1,
         "tp2": tp2,
         "tp3": tp3,
+        "atr_1h": atr_value,  # AI can use ATR as a safety reference
         "base_confidence": base_conf,
         "chg_1h_pct": chg1h,
         "chg_24h_pct": chg24,
@@ -505,12 +637,11 @@ def scan_and_collect(conn):
         chg1h = c.get("price_change_percentage_1h_in_currency")
         chg24 = c.get("price_change_percentage_24h")
         entry = c.get("current_price")
-        high_24h = c.get("high_24h")
-        low_24h = c.get("low_24h")
 
         if chg1h is None or chg24 is None or entry is None:
             continue
 
+        # LONG / SHORT decision
         side = None
         if chg24 > MIN_24H and chg1h > MIN_1H:
             side = "LONG"
@@ -537,14 +668,49 @@ def scan_and_collect(conn):
         if key in pending_keys:
             continue
 
-        levels = build_levels(entry, side, high_24h, low_24h)
+        # ---------------------------
+        # BASELINE TP/SL (Binance ATR)
+        # ---------------------------
+        highs, lows, closes = fetch_binance_klines_usdt(sym, interval="1h", limit=120)
+        levels = build_levels_from_candles(entry, side, highs, lows, closes)
+
+        # If Binance doesn't have the pair, fallback to CoinGecko 24h high/low method
         if not levels:
-            continue
+            high_24h = c.get("high_24h")
+            low_24h = c.get("low_24h")
+            if high_24h is None or low_24h is None or high_24h <= 0 or low_24h <= 0:
+                continue
+
+            # old fallback (less ideal but safe)
+            if side == "LONG":
+                sl = low_24h * 0.997
+                risk = entry - sl
+                if risk <= 0:
+                    continue
+                tp1 = entry + 0.8 * risk
+                tp2 = entry + 1.2 * risk
+                tp3 = entry + 1.6 * risk
+            else:
+                sl = high_24h * 1.003
+                risk = sl - entry
+                if risk <= 0:
+                    continue
+                tp1 = entry - 0.7 * risk
+                tp2 = entry - 1.0 * risk
+                tp3 = entry - 1.3 * risk
+
+            levels = (sl, tp1, tp2, tp3)
+            atr_val = None
+        else:
+            atr_val = _atr(highs, lows, closes, period=14)
+
         sl, tp1, tp2, tp3 = levels
 
+        # Base confidence
         conf = score(chg24, chg1h)
         notes = []
 
+        # Memory layer (A + B)
         blocked, mem_delta, mem_note = apply_memory_rules(conn, sym, side)
         if mem_note:
             notes.append(mem_note)
@@ -553,22 +719,55 @@ def scan_and_collect(conn):
 
         conf_after_mem = max(0, min(100, conf + mem_delta))
 
+        # ----------------------
+        # AI Layer (fail-safe)
+        # - approve/reject
+        # - confidence adjust
+        # - optional TP/SL refine
+        # ----------------------
         final_conf = conf_after_mem
         if ai_enabled():
             try:
                 mem_total, mem_wr = get_recent_side_performance(conn, sym, side)
+
                 ctx = build_ai_context(
-                    coin_name, sym, side, entry, sl, tp1, tp2, tp3,
-                    conf_after_mem, chg1h, chg24,
-                    mem_total=mem_total, mem_winrate=mem_wr
+                    coin_name=coin_name,
+                    sym=sym,
+                    side=side,
+                    entry=entry,
+                    sl=sl,
+                    tp1=tp1,
+                    tp2=tp2,
+                    tp3=tp3,
+                    base_conf=conf_after_mem,
+                    chg1h=chg1h,
+                    chg24=chg24,
+                    atr_value=atr_val,
+                    mem_total=mem_total,
+                    mem_winrate=mem_wr
                 )
-                approved, adj, reason = judge_trade(ctx)
+
+                approved, adj, reason, ai_levels = judge_trade(ctx)
                 if not approved:
                     continue
+
                 final_conf = max(0, min(100, conf_after_mem + int(adj)))
+
+                # Only accept AI TP/SL if we have ATR to validate conservatively
+                if atr_val is not None:
+                    sl, tp1, tp2, tp3 = validate_ai_levels(
+                        side=side,
+                        entry=entry,
+                        atr_value=atr_val,
+                        fallback_levels=(sl, tp1, tp2, tp3),
+                        ai_levels=ai_levels
+                    )
+
                 if reason:
                     notes.append(f"AI: {reason} ({int(adj):+d})")
+
             except Exception:
+                # AI failed -> keep baseline
                 final_conf = conf_after_mem
 
         if final_conf < CONFIDENCE_MIN:
@@ -577,6 +776,7 @@ def scan_and_collect(conn):
         # Set cooldown BEFORE saving/sending so restarts don't resend
         set_cooldown(conn, sym, side, cooldown_cache)
 
+        # Save trade (store final confidence + final levels)
         insert_trade(conn, ts_iso, sym, coin_id, coin_name, side, entry, sl, tp1, tp2, tp3, final_conf, chg1h, chg24)
 
         pending_keys.add(key)
