@@ -70,7 +70,6 @@ def judge_trade(trade: Dict[str, Any]) -> Tuple[bool, int, str, Dict[str, float]
     try:
         out = json.loads(raw)
     except Exception:
-        # ultra-safe fallback: reject rather than crash
         return False, 0, "AI parse error", {}
 
     approved = bool(out.get("approved", False))
