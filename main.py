@@ -1,5 +1,6 @@
 import os
 import time
+import math
 import requests
 import psycopg2
 from datetime import datetime, timezone, timedelta
@@ -28,69 +29,73 @@ if not BOT_TOKEN or not CHAT_ID or not DATABASE_URL:
 # ======================
 # SETTINGS
 # ======================
-SCAN_EVERY_SECONDS = 600          # scan every 10 minutes (analyse 24/7)
-TOP_N_COINS = 150                 # Top 150 only (CoinGecko)
-CONFIDENCE_MIN = 65               # only send signals >= 65 confidence
-MAX_SIGNALS_PER_HOUR = 10         # prevent spam
+SCAN_EVERY_SECONDS = 600          # scan every 10 minutes
+TOP_N_COINS = 150                 # Top N CoinGecko
+CONFIDENCE_MIN = 65
+MAX_SIGNALS_PER_HOUR = 10
 
 # Momentum thresholds
 MIN_24H = 1.5
 MIN_1H = 0.4
 
-# Cooldown per symbol+side to avoid repeats (PERSISTENT via DB)
+# Cooldown per symbol+side (persistent via DB)
 ALERT_COOLDOWN_SECONDS = 60 * 60  # 1 hour
 
-# In-memory fallback cooldowns (used only if DB check fails)
+# In-memory fallback cooldown
 last_alert_time = {}
 
-# Pending signals bucket (collect during hour, send hourly)
+# Pending hourly bucket
 pending_signals = []
-pending_keys = set()  # (symbol, side)
+pending_keys = set()
 
-# ======================
-# MEMORY RULES (A + B)
-# ======================
+# Memory rules
 MEM_STRICT_MIN_TRADES = 6
 MEM_STRICT_BLOCK_BELOW_WINRATE = 0.30
-
 MEM_SOFT_MIN_TRADES = 4
 MEM_SOFT_PENALIZE_BELOW_WINRATE = 0.45
 MEM_SOFT_PENALTY = -10
-
 MEM_LOOKBACK_DAYS = 14
 
-# ======================
-# COINGECKO RATE LIMIT PROTECTION
-# ======================
+# CoinGecko rate protection
 COINGECKO_TIMEOUT = 30
 COINGECKO_MAX_RETRIES = 6
 
-# Cache last good markets snapshot so bot can keep running during 429 bursts
-MARKETS_CACHE_TTL_SECONDS = 20 * 60  # 20 minutes
+MARKETS_CACHE_TTL_SECONDS = 20 * 60
 _last_markets = None
 _last_markets_ts = 0
 
-# Reduce /simple/price frequency (open trade monitoring)
-OPEN_TRADES_CHECK_EVERY_SECONDS = 30 * 60  # 30 minutes
+OPEN_TRADES_CHECK_EVERY_SECONDS = 30 * 60
 _last_open_check_ts = 0
 
-# One requests session (slightly nicer to APIs)
+# Telegram limits (important!)
+TELEGRAM_MAX_CHARS = 3900  # keep under 4096 to be safe
+TELEGRAM_SEND_RETRIES = 4
+
+# Requests session
 SESSION = requests.Session()
 SESSION.headers.update({
-    "User-Agent": "brads-trading-bot/2.0 (signals-only; rate-safe)"
+    "User-Agent": "brads-trading-bot/2.1 (signals-only; rate-safe)"
 })
 
 # ======================
-# BINANCE CANDLE DATA (for realistic ATR + structure)
+# BINANCE CANDLE DATA (throttled)
 # ======================
 BINANCE_TIMEOUT = 10
 BINANCE_MAX_RETRIES = 3
+BINANCE_KLINES_CACHE_TTL_SECONDS = 60 * 60  # cache 1h per symbol
+_binance_cache = {}  # key -> (ts, highs, lows, closes)
 
 def fetch_binance_klines_usdt(symbol_upper: str, interval="1h", limit=120):
     """
     Returns highs, lows, closes arrays from Binance klines using SYMBOLUSDT.
-    Fail-safe: returns (None, None, None) if not available.
+    Throttled with cache. Fail-safe returns (None, None, None).
     """
+    now = time.time()
+    cache_key = (symbol_upper, interval, limit)
+    cached = _binance_cache.get(cache_key)
+    if cached and (now - cached[0]) < BINANCE_KLINES_CACHE_TTL_SECONDS:
+        return cached[1], cached[2], cached[3]
+
     pair = f"{symbol_upper}USDT"
     url = "https://api.binance.com/api/v3/klines"
     params = {"symbol": pair, "interval": interval, "limit": limit}
@@ -103,6 +108,9 @@ def fetch_binance_klines_usdt(symbol_upper: str, interval="1h", limit=120):
                 time.sleep(delay)
                 delay = min(delay * 2, 20)
                 continue
+            if r.status_code == 400:
+                # Pair doesn't exist on Binance
+                return None, None, None
             r.raise_for_status()
             rows = r.json()
             highs = [float(x[2]) for x in rows]
@@ -110,6 +118,8 @@ def fetch_binance_klines_usdt(symbol_upper: str, interval="1h", limit=120):
             closes = [float(x[4]) for x in rows]
             if len(closes) < 20:
                 return None, None, None
+
+            _binance_cache[cache_key] = (now, highs, lows, closes)
             return highs, lows, closes
         except Exception:
             time.sleep(delay)
@@ -121,9 +131,6 @@ def fetch_binance_klines_usdt(symbol_upper: str, interval="1h", limit=120):
 # ATR + CONSERVATIVE LEVELS
 # ======================
 def _atr(highs, lows, closes, period=14):
-    """
-    Simple ATR calculation (good enough for signal targets).
-    """
     try:
         if not highs or not lows or not closes:
             return None
@@ -147,9 +154,7 @@ def _atr(highs, lows, closes, period=14):
 
 def build_levels_from_candles(entry, side, highs, lows, closes):
     """
-    Conservative & realistic targets:
-    - SL beyond structure + ATR padding
-    - TP ladder based on ATR and capped by structure (swing levels)
+    Conservative targets based on ATR and recent swing structure.
     """
     if entry is None or highs is None or lows is None or closes is None:
         return None
@@ -163,14 +168,11 @@ def build_levels_from_candles(entry, side, highs, lows, closes):
     recent_low = min(lows[-lookback:])
 
     if side == "LONG":
-        # SL slightly beyond recent low + small padding
         sl = min(entry - 1.10 * atr, recent_low - 0.20 * atr)
-
         tp1 = entry + 0.60 * atr
         tp2 = entry + 1.00 * atr
         tp3 = entry + 1.40 * atr
 
-        # Cap near realistic resistance
         tp1 = min(tp1, recent_high * 0.995)
         tp2 = min(tp2, recent_high * 1.000)
         tp3 = min(tp3, recent_high * 1.005)
@@ -181,12 +183,10 @@ def build_levels_from_candles(entry, side, highs, lows, closes):
 
     else:  # SHORT
         sl = max(entry + 1.10 * atr, recent_high + 0.20 * atr)
-
         tp1 = entry - 0.55 * atr
         tp2 = entry - 0.90 * atr
         tp3 = entry - 1.25 * atr
 
-        # Cap near realistic support
         tp1 = max(tp1, recent_low * 1.005)
         tp2 = max(tp2, recent_low * 1.000)
         tp3 = max(tp3, recent_low * 0.995)
@@ -196,12 +196,6 @@ def build_levels_from_candles(entry, side, highs, lows, closes):
         return sl, tp1, tp2, tp3
 
 def validate_ai_levels(side, entry, atr_value, fallback_levels, ai_levels):
-    """
-    AI kill-switch: accept AI TP/SL only if:
-    - ordering is correct
-    - distances are conservative (ATR-based clamps)
-    Otherwise return fallback.
-    """
     if not ai_levels:
         return fallback_levels
 
@@ -213,7 +207,6 @@ def validate_ai_levels(side, entry, atr_value, fallback_levels, ai_levels):
     except Exception:
         return fallback_levels
 
-    # If ATR missing, don't accept AI override (keep baseline)
     if atr_value is None or atr_value <= 0:
         return fallback_levels
 
@@ -226,8 +219,7 @@ def validate_ai_levels(side, entry, atr_value, fallback_levels, ai_levels):
             return fallback_levels
         if (entry - sl) > 1.3 * atr_value:
             return fallback_levels
-
-    else:  # SHORT
+    else:
         if not (tp3 < tp2 < tp1 < entry < sl):
             return fallback_levels
         if (entry - tp1) > 1.2 * atr_value:
@@ -253,7 +245,7 @@ def db_connect():
             symbol TEXT NOT NULL,
             coin_id TEXT NOT NULL,
             coin_name TEXT NOT NULL,
-            side TEXT NOT NULL,             -- LONG / SHORT
+            side TEXT NOT NULL,
             entry DOUBLE PRECISION NOT NULL,
             stop_loss DOUBLE PRECISION NOT NULL,
             tp1 DOUBLE PRECISION NOT NULL,
@@ -262,8 +254,8 @@ def db_connect():
             confidence INTEGER NOT NULL,
             chg1h DOUBLE PRECISION,
             chg24 DOUBLE PRECISION,
-            status TEXT NOT NULL DEFAULT 'OPEN',  -- OPEN / CLOSED
-            result TEXT,                          -- WIN / LOSS
+            status TEXT NOT NULL DEFAULT 'OPEN',
+            result TEXT,
             closed_ts_utc TEXT
         )
     """)
@@ -276,7 +268,6 @@ def db_connect():
             PRIMARY KEY (symbol, side)
         )
     """)
-
     conn.commit()
     return conn
 
@@ -332,7 +323,7 @@ def get_win_stats(conn):
     return all_time_win_pct, total, last7_win_pct, total7
 
 # ======================
-# PERSISTENT COOLDOWNS (DB)
+# COOLDOWNS
 # ======================
 def load_cooldowns(conn):
     try:
@@ -375,12 +366,65 @@ def should_alert_fallback_ram(symbol, side):
     return True
 
 # ======================
-# TELEGRAM
+# TELEGRAM (SAFE SEND + CHUNKING)
 # ======================
-def send_message(text):
+def _telegram_post(text, parse_mode="Markdown"):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}
-    SESSION.post(url, json=payload, timeout=20)
+    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": parse_mode}
+    return SESSION.post(url, json=payload, timeout=20)
+
+def send_message(text):
+    """
+    Safe send:
+    - retries/backoff
+    - fallback to plain text if Markdown fails
+    """
+    delay = 2
+    for attempt in range(TELEGRAM_SEND_RETRIES):
+        try:
+            r = _telegram_post(text, parse_mode="Markdown")
+            if r.status_code >= 400:
+                # If markdown breaks, try plain text once
+                if attempt == 0:
+                    r2 = _telegram_post(text, parse_mode=None)
+                    if r2.ok:
+                        return
+                r.raise_for_status()
+            return
+        except Exception:
+            time.sleep(delay)
+            delay = min(delay * 2, 20)
+
+def send_long_message(text):
+    """
+    Splits big messages into multiple Telegram messages under limit.
+    """
+    if not text:
+        return
+    if len(text) <= TELEGRAM_MAX_CHARS:
+        send_message(text)
+        return
+
+    parts = []
+    buf = ""
+    for block in text.split("\n\n"):
+        candidate = (buf + ("\n\n" if buf else "") + block)
+        if len(candidate) <= TELEGRAM_MAX_CHARS:
+            buf = candidate
+        else:
+            if buf:
+                parts.append(buf)
+            # if a single block is huge, hard-slice it
+            while len(block) > TELEGRAM_MAX_CHARS:
+                parts.append(block[:TELEGRAM_MAX_CHARS])
+                block = block[TELEGRAM_MAX_CHARS:]
+            buf = block
+    if buf:
+        parts.append(buf)
+
+    for p in parts:
+        send_message(p)
+        time.sleep(1.2)  # gentle spacing
 
 # ======================
 # COINGECKO SAFE HTTP
@@ -392,7 +436,6 @@ def _get_json_with_backoff(url, params):
     for _ in range(COINGECKO_MAX_RETRIES):
         try:
             r = SESSION.get(url, params=params, timeout=COINGECKO_TIMEOUT)
-
             if r.status_code == 429:
                 retry_after = r.headers.get("Retry-After")
                 if retry_after:
@@ -403,10 +446,8 @@ def _get_json_with_backoff(url, params):
                 time.sleep(delay)
                 delay = min(delay * 2, 120)
                 continue
-
             r.raise_for_status()
             return r.json()
-
         except Exception as e:
             last_err = e
             time.sleep(delay)
@@ -414,9 +455,6 @@ def _get_json_with_backoff(url, params):
 
     raise RuntimeError(f"CoinGecko request failed after retries: {last_err}")
 
-# ======================
-# MARKET DATA (CoinGecko)
-# ======================
 def fetch_top_markets(top_n=150):
     global _last_markets, _last_markets_ts
 
@@ -442,12 +480,9 @@ def fetch_top_markets(top_n=150):
 def fetch_simple_price_usd(coin_ids):
     if not coin_ids:
         return {}
-
     coin_ids = list(dict.fromkeys(coin_ids))[:200]
-
     url = "https://api.coingecko.com/api/v3/simple/price"
     params = {"ids": ",".join(coin_ids), "vs_currencies": "usd"}
-
     data = _get_json_with_backoff(url, params)
     return {k: v.get("usd") for k, v in data.items()}
 
@@ -458,7 +493,7 @@ def score(chg24, chg1h):
     return max(0, min(100, int(abs(chg24) * 6 + abs(chg1h) * 30)))
 
 # ======================
-# DECISION MEMORY (DB)
+# DECISION MEMORY
 # ======================
 def get_recent_side_performance(conn, symbol, side):
     try:
@@ -526,7 +561,7 @@ def build_ai_context(coin_name, sym, side, entry, sl, tp1, tp2, tp3, base_conf, 
         "tp1": tp1,
         "tp2": tp2,
         "tp3": tp3,
-        "atr_1h": atr_value,  # AI can use ATR as a safety reference
+        "atr_1h": atr_value,
         "base_confidence": base_conf,
         "chg_1h_pct": chg1h,
         "chg_24h_pct": chg24,
@@ -581,9 +616,6 @@ def format_hourly_header(conn, time_str):
 # TRADE OUTCOME TRACKING
 # ======================
 def update_open_trades(conn):
-    """
-    Rate-safe: only do this every OPEN_TRADES_CHECK_EVERY_SECONDS.
-    """
     global _last_open_check_ts
     now = time.time()
     if (now - _last_open_check_ts) < OPEN_TRADES_CHECK_EVERY_SECONDS:
@@ -615,14 +647,14 @@ def update_open_trades(conn):
                 close_trade(conn, trade_id, "LOSS")
             elif px >= tp1:
                 close_trade(conn, trade_id, "WIN")
-        else:  # SHORT
+        else:
             if px >= sl:
                 close_trade(conn, trade_id, "LOSS")
             elif px <= tp1:
                 close_trade(conn, trade_id, "WIN")
 
 # ======================
-# SCAN + COLLECT
+# SCAN + COLLECT (BINANCE THROTTLED)
 # ======================
 def scan_and_collect(conn):
     global pending_signals, pending_keys
@@ -630,18 +662,15 @@ def scan_and_collect(conn):
     markets = fetch_top_markets(TOP_N_COINS)
     now_str = datetime.now(timezone.utc).strftime("%H:%M UTC")
     ts_iso = datetime.now(timezone.utc).isoformat()
-
     cooldown_cache = load_cooldowns(conn)
 
     for c in markets:
         chg1h = c.get("price_change_percentage_1h_in_currency")
         chg24 = c.get("price_change_percentage_24h")
         entry = c.get("current_price")
-
         if chg1h is None or chg24 is None or entry is None:
             continue
 
-        # LONG / SHORT decision
         side = None
         if chg24 > MIN_24H and chg1h > MIN_1H:
             side = "LONG"
@@ -656,7 +685,7 @@ def scan_and_collect(conn):
         if not sym or not coin_id:
             continue
 
-        # Persistent cooldown (DB); fallback to RAM if needed
+        # cooldown
         try:
             if not cooldown_ok(sym, side, cooldown_cache):
                 continue
@@ -668,20 +697,36 @@ def scan_and_collect(conn):
         if key in pending_keys:
             continue
 
+        # base confidence + memory (do these BEFORE Binance to reduce API hits)
+        conf = score(chg24, chg1h)
+        blocked, mem_delta, mem_note = apply_memory_rules(conn, sym, side)
+        if blocked:
+            continue
+        conf_after_mem = max(0, min(100, conf + mem_delta))
+        if conf_after_mem < CONFIDENCE_MIN:
+            continue
+
+        notes = []
+        if mem_note:
+            notes.append(mem_note)
+
         # ---------------------------
-        # BASELINE TP/SL (Binance ATR)
+        # Build realistic levels (Binance FIRST, but only for passing candidates)
         # ---------------------------
         highs, lows, closes = fetch_binance_klines_usdt(sym, interval="1h", limit=120)
         levels = build_levels_from_candles(entry, side, highs, lows, closes)
 
-        # If Binance doesn't have the pair, fallback to CoinGecko 24h high/low method
+        atr_val = None
+        if levels:
+            atr_val = _atr(highs, lows, closes, period=14)
+
+        # CoinGecko fallback if Binance not available
         if not levels:
             high_24h = c.get("high_24h")
             low_24h = c.get("low_24h")
             if high_24h is None or low_24h is None or high_24h <= 0 or low_24h <= 0:
                 continue
 
-            # old fallback (less ideal but safe)
             if side == "LONG":
                 sl = low_24h * 0.997
                 risk = entry - sl
@@ -700,36 +745,16 @@ def scan_and_collect(conn):
                 tp3 = entry - 1.3 * risk
 
             levels = (sl, tp1, tp2, tp3)
-            atr_val = None
-        else:
-            atr_val = _atr(highs, lows, closes, period=14)
 
         sl, tp1, tp2, tp3 = levels
 
-        # Base confidence
-        conf = score(chg24, chg1h)
-        notes = []
-
-        # Memory layer (A + B)
-        blocked, mem_delta, mem_note = apply_memory_rules(conn, sym, side)
-        if mem_note:
-            notes.append(mem_note)
-        if blocked:
-            continue
-
-        conf_after_mem = max(0, min(100, conf + mem_delta))
-
         # ----------------------
         # AI Layer (fail-safe)
-        # - approve/reject
-        # - confidence adjust
-        # - optional TP/SL refine
         # ----------------------
         final_conf = conf_after_mem
         if ai_enabled():
             try:
                 mem_total, mem_wr = get_recent_side_performance(conn, sym, side)
-
                 ctx = build_ai_context(
                     coin_name=coin_name,
                     sym=sym,
@@ -753,7 +778,7 @@ def scan_and_collect(conn):
 
                 final_conf = max(0, min(100, conf_after_mem + int(adj)))
 
-                # Only accept AI TP/SL if we have ATR to validate conservatively
+                # Only accept AI TP/SL if ATR available
                 if atr_val is not None:
                     sl, tp1, tp2, tp3 = validate_ai_levels(
                         side=side,
@@ -765,18 +790,16 @@ def scan_and_collect(conn):
 
                 if reason:
                     notes.append(f"AI: {reason} ({int(adj):+d})")
-
             except Exception:
-                # AI failed -> keep baseline
                 final_conf = conf_after_mem
 
         if final_conf < CONFIDENCE_MIN:
             continue
 
-        # Set cooldown BEFORE saving/sending so restarts don't resend
+        # persist cooldown
         set_cooldown(conn, sym, side, cooldown_cache)
 
-        # Save trade (store final confidence + final levels)
+        # save + collect
         insert_trade(conn, ts_iso, sym, coin_id, coin_name, side, entry, sl, tp1, tp2, tp3, final_conf, chg1h, chg24)
 
         pending_keys.add(key)
@@ -788,7 +811,7 @@ def scan_and_collect(conn):
             break
 
 # ======================
-# HOURLY SEND CONTROL
+# HOURLY SEND
 # ======================
 def should_send_now(last_sent_hour):
     now = datetime.now(timezone.utc)
@@ -803,7 +826,8 @@ def send_hourly_update(conn):
 
     if pending_signals:
         body = "\n\n".join(pending_signals)
-        send_message(f"{header}\n\n{body}")
+        msg = f"{header}\n\n{body}"
+        send_long_message(msg)  # ✅ chunked safe send
     else:
         send_message(f"{header}\n\n❌ *No coins worth investing in.*\n\n_Not financial advice_")
 
@@ -811,7 +835,7 @@ def send_hourly_update(conn):
     pending_keys = set()
 
 # ======================
-# MAIN LOOP (RATE-SAFE)
+# MAIN LOOP
 # ======================
 def main():
     conn = db_connect()
@@ -823,25 +847,23 @@ def main():
         f"🤖 AI Filter: {ai_status}\n"
         "🧠 Decision Memory: ON ✅\n"
         "🕒 Persistent Cooldowns: ON ✅\n"
+        "📩 Telegram Chunking: ON ✅\n"
         "_Not financial advice_"
     )
 
     last_sent_hour = None
 
     while True:
-        # 1) Open trade monitoring (rate-limited internally)
         try:
             update_open_trades(conn)
         except Exception as e:
             print("update_open_trades error:", e)
 
-        # 2) Scan market (protected by backoff + cache)
         try:
             scan_and_collect(conn)
         except Exception as e:
             print("scan_and_collect error:", e)
 
-        # 3) ALWAYS attempt hourly send, even if CoinGecko failed
         try:
             do_send, last_sent_hour = should_send_now(last_sent_hour)
             if do_send:
