@@ -154,7 +154,14 @@ def _atr(highs, lows, closes, period=14):
 
 def build_levels_from_candles(entry, side, highs, lows, closes):
     """
-    Conservative targets based on ATR and recent swing structure.
+    Conservative targets based on ATR and recent swing structure,
+    but with HARD caps on take profits:
+
+      TP1 max = +2%  (or -2% for short)
+      TP2 max = +3.5%
+      TP3 max = +5%
+
+    This keeps targets realistic and prevents huge ATR-driven jumps.
     """
     if entry is None or highs is None or lows is None or closes is None:
         return None
@@ -167,26 +174,56 @@ def build_levels_from_candles(entry, side, highs, lows, closes):
     recent_high = max(highs[-lookback:])
     recent_low = min(lows[-lookback:])
 
+    # HARD TP caps (your request)
+    TP1_CAP = 0.02
+    TP2_CAP = 0.035
+    TP3_CAP = 0.05
+
     if side == "LONG":
         sl = min(entry - 1.10 * atr, recent_low - 0.20 * atr)
-        tp1 = entry + 0.60 * atr
-        tp2 = entry + 1.00 * atr
-        tp3 = entry + 1.40 * atr
 
+        # Original ATR-based ladder (good structure)
+        tp1_atr = entry + 0.60 * atr
+        tp2_atr = entry + 1.00 * atr
+        tp3_atr = entry + 1.40 * atr
+
+        # Hard percent caps (max distance)
+        tp1_cap = entry * (1.0 + TP1_CAP)
+        tp2_cap = entry * (1.0 + TP2_CAP)
+        tp3_cap = entry * (1.0 + TP3_CAP)
+
+        # Apply cap first
+        tp1 = min(tp1_atr, tp1_cap)
+        tp2 = min(tp2_atr, tp2_cap)
+        tp3 = min(tp3_atr, tp3_cap)
+
+        # Respect resistance structure
         tp1 = min(tp1, recent_high * 0.995)
         tp2 = min(tp2, recent_high * 1.000)
         tp3 = min(tp3, recent_high * 1.005)
 
+        # Ensure strict ordering (avoid equal/invalid)
         if not (sl < entry < tp1 < tp2 < tp3):
             return None
         return sl, tp1, tp2, tp3
 
     else:  # SHORT
         sl = max(entry + 1.10 * atr, recent_high + 0.20 * atr)
-        tp1 = entry - 0.55 * atr
-        tp2 = entry - 0.90 * atr
-        tp3 = entry - 1.25 * atr
 
+        tp1_atr = entry - 0.55 * atr
+        tp2_atr = entry - 0.90 * atr
+        tp3_atr = entry - 1.25 * atr
+
+        tp1_cap = entry * (1.0 - TP1_CAP)
+        tp2_cap = entry * (1.0 - TP2_CAP)
+        tp3_cap = entry * (1.0 - TP3_CAP)
+
+        # For shorts: tp is below entry, "cap" means not too far down
+        tp1 = max(tp1_atr, tp1_cap)
+        tp2 = max(tp2_atr, tp2_cap)
+        tp3 = max(tp3_atr, tp3_cap)
+
+        # Respect support structure
         tp1 = max(tp1, recent_low * 1.005)
         tp2 = max(tp2, recent_low * 1.000)
         tp3 = max(tp3, recent_low * 0.995)
@@ -374,17 +411,11 @@ def _telegram_post(text, parse_mode="Markdown"):
     return SESSION.post(url, json=payload, timeout=20)
 
 def send_message(text):
-    """
-    Safe send:
-    - retries/backoff
-    - fallback to plain text if Markdown fails
-    """
     delay = 2
     for attempt in range(TELEGRAM_SEND_RETRIES):
         try:
             r = _telegram_post(text, parse_mode="Markdown")
             if r.status_code >= 400:
-                # If markdown breaks, try plain text once
                 if attempt == 0:
                     r2 = _telegram_post(text, parse_mode=None)
                     if r2.ok:
@@ -396,9 +427,6 @@ def send_message(text):
             delay = min(delay * 2, 20)
 
 def send_long_message(text):
-    """
-    Splits big messages into multiple Telegram messages under limit.
-    """
     if not text:
         return
     if len(text) <= TELEGRAM_MAX_CHARS:
@@ -414,7 +442,6 @@ def send_long_message(text):
         else:
             if buf:
                 parts.append(buf)
-            # if a single block is huge, hard-slice it
             while len(block) > TELEGRAM_MAX_CHARS:
                 parts.append(block[:TELEGRAM_MAX_CHARS])
                 block = block[TELEGRAM_MAX_CHARS:]
@@ -424,7 +451,7 @@ def send_long_message(text):
 
     for p in parts:
         send_message(p)
-        time.sleep(1.2)  # gentle spacing
+        time.sleep(1.2)
 
 # ======================
 # COINGECKO SAFE HTTP
@@ -727,22 +754,45 @@ def scan_and_collect(conn):
             if high_24h is None or low_24h is None or high_24h <= 0 or low_24h <= 0:
                 continue
 
+            # HARD caps (same as candle logic)
+            TP1_CAP = 0.02
+            TP2_CAP = 0.035
+            TP3_CAP = 0.05
+
             if side == "LONG":
                 sl = low_24h * 0.997
-                risk = entry - sl
-                if risk <= 0:
+                if sl >= entry:
                     continue
-                tp1 = entry + 0.8 * risk
-                tp2 = entry + 1.2 * risk
-                tp3 = entry + 1.6 * risk
+
+                # capped percent targets
+                tp1 = entry * (1.0 + TP1_CAP)
+                tp2 = entry * (1.0 + TP2_CAP)
+                tp3 = entry * (1.0 + TP3_CAP)
+
+                # respect 24h high
+                tp1 = min(tp1, high_24h * 0.995)
+                tp2 = min(tp2, high_24h * 1.000)
+                tp3 = min(tp3, high_24h * 1.005)
+
+                if not (sl < entry < tp1 < tp2 < tp3):
+                    continue
+
             else:
                 sl = high_24h * 1.003
-                risk = sl - entry
-                if risk <= 0:
+                if sl <= entry:
                     continue
-                tp1 = entry - 0.7 * risk
-                tp2 = entry - 1.0 * risk
-                tp3 = entry - 1.3 * risk
+
+                tp1 = entry * (1.0 - TP1_CAP)
+                tp2 = entry * (1.0 - TP2_CAP)
+                tp3 = entry * (1.0 - TP3_CAP)
+
+                # respect 24h low
+                tp1 = max(tp1, low_24h * 1.005)
+                tp2 = max(tp2, low_24h * 1.000)
+                tp3 = max(tp3, low_24h * 0.995)
+
+                if not (tp3 < tp2 < tp1 < entry < sl):
+                    continue
 
             levels = (sl, tp1, tp2, tp3)
 
@@ -827,7 +877,7 @@ def send_hourly_update(conn):
     if pending_signals:
         body = "\n\n".join(pending_signals)
         msg = f"{header}\n\n{body}"
-        send_long_message(msg)  # ✅ chunked safe send
+        send_long_message(msg)
     else:
         send_message(f"{header}\n\n❌ *No coins worth investing in.*\n\n_Not financial advice_")
 
