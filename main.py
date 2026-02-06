@@ -32,15 +32,15 @@ if not BOT_TOKEN or not CHAT_ID or not DATABASE_URL:
 # ======================
 # SETTINGS
 # ======================
-# Scan loop (keep it fast so entries stay accurate)
-SCAN_EVERY_SECONDS = int(os.getenv("SCAN_EVERY_SECONDS", "60"))
+# ✅ UPDATED (Option B): scan every 14 minutes by default (override in Railway env var if you want)
+SCAN_EVERY_SECONDS = int(os.getenv("SCAN_EVERY_SECONDS", "840"))  # 14 mins
 
 CONFIDENCE_MIN = 65
 
 # Safety spam guard (rolling hour)
 MAX_SIGNALS_PER_HOUR = 10
 
-# ✅ NEW: send signals ONLY on quarter-hour batches (00,15,30,45)
+# ✅ send signals ONLY on quarter-hour batches (00,15,30,45)
 SEND_BATCH_EVERY_MINUTES = int(os.getenv("SEND_BATCH_EVERY_MINUTES", "15"))  # do not change unless you want different schedule
 
 # Momentum thresholds
@@ -87,7 +87,7 @@ TELEGRAM_SEND_RETRIES = 4
 # Requests session
 SESSION = requests.Session()
 SESSION.headers.update({
-    "User-Agent": "brads-trading-bot/2.4 (batch-15min; hourly-summary; whitelist; rate-safe)"
+    "User-Agent": "brads-trading-bot/2.5 (scan-14min; batch-15min; hourly-summary; whitelist; rate-safe)"
 })
 
 # ==============================
@@ -642,14 +642,17 @@ def send_long_message(text):
 # ======================
 # COINGECKO SAFE HTTP
 # ======================
+# ✅ FIXED: always captures a real error message (not None)
 def _get_json_with_backoff(url, params):
     delay = 5
-    last_err = None
+    last_err = "unknown"
 
     for _ in range(COINGECKO_MAX_RETRIES):
         try:
             r = SESSION.get(url, params=params, timeout=COINGECKO_TIMEOUT)
+
             if r.status_code == 429:
+                last_err = "HTTP 429 rate limit"
                 retry_after = r.headers.get("Retry-After")
                 if retry_after:
                     try:
@@ -659,10 +662,17 @@ def _get_json_with_backoff(url, params):
                 time.sleep(delay)
                 delay = min(delay * 2, 120)
                 continue
-            r.raise_for_status()
+
+            if r.status_code >= 400:
+                last_err = f"HTTP {r.status_code}"
+                time.sleep(delay)
+                delay = min(delay * 2, 120)
+                continue
+
             return r.json()
+
         except Exception as e:
-            last_err = e
+            last_err = str(e)
             time.sleep(delay)
             delay = min(delay * 2, 120)
 
@@ -673,11 +683,13 @@ def _chunk_list(items, chunk_size):
     for i in range(0, len(items), chunk_size):
         yield items[i:i + chunk_size]
 
+# ✅ FIXED: if CoinGecko fails, fall back to cached markets (bot keeps running)
 def fetch_whitelist_markets():
     """
     Fetch ONLY the coins in COINGECKO_COIN_IDS.
     Uses CoinGecko /coins/markets with ids=... (chunked for safety).
     Cached to reduce API calls.
+    Falls back to cached data if CoinGecko is rate-limited/down.
     """
     global _last_markets, _last_markets_ts
 
@@ -686,25 +698,32 @@ def fetch_whitelist_markets():
         return _last_markets
 
     url = "https://api.coingecko.com/api/v3/coins/markets"
-
     all_rows = []
-    for chunk in _chunk_list(sorted(COINGECKO_COIN_IDS), 200):
-        params = {
-            "vs_currency": "usd",
-            "ids": ",".join(chunk),
-            "order": "market_cap_desc",
-            "sparkline": "false",
-            "price_change_percentage": "1h,24h",
-            "per_page": len(chunk),
-            "page": 1,
-        }
-        data = _get_json_with_backoff(url, params)
-        if isinstance(data, list):
-            all_rows.extend(data)
 
-    _last_markets = all_rows
-    _last_markets_ts = now
-    return all_rows
+    try:
+        for chunk in _chunk_list(sorted(COINGECKO_COIN_IDS), 200):
+            params = {
+                "vs_currency": "usd",
+                "ids": ",".join(chunk),
+                "order": "market_cap_desc",
+                "sparkline": "false",
+                "price_change_percentage": "1h,24h",
+                "per_page": len(chunk),
+                "page": 1,
+            }
+            data = _get_json_with_backoff(url, params)
+            if isinstance(data, list):
+                all_rows.extend(data)
+
+        _last_markets = all_rows
+        _last_markets_ts = now
+        return all_rows
+
+    except Exception as e:
+        print("CoinGecko fallback used:", e)
+        if _last_markets:
+            return _last_markets
+        raise
 
 def fetch_simple_price_usd(coin_ids):
     if not coin_ids:
@@ -1072,7 +1091,6 @@ _last_quarter_key = None
 _last_hour_key = None
 
 def _current_quarter_key(dt: datetime) -> str:
-    # e.g. "2026-02-06 15:45"
     minute_bucket = (dt.minute // SEND_BATCH_EVERY_MINUTES) * SEND_BATCH_EVERY_MINUTES
     return dt.strftime("%Y-%m-%d %H:") + f"{minute_bucket:02d}"
 
@@ -1083,12 +1101,10 @@ def should_send_quarter_batch():
     if SEND_BATCH_EVERY_MINUTES <= 0:
         return False
 
-    # only send when minute aligns exactly (00/15/30/45) and near the start
     aligned = (now.minute % SEND_BATCH_EVERY_MINUTES == 0)
     if not aligned:
         return False
 
-    # don't require exact second 0; allow first ~8 seconds so loop timing doesn't miss it
     if now.second > 8:
         return False
 
