@@ -32,16 +32,13 @@ if not BOT_TOKEN or not CHAT_ID or not DATABASE_URL:
 # ======================
 # SETTINGS
 # ======================
-# ✅ UPDATED (Option B): scan every 14 minutes by default (override in Railway env var if you want)
-SCAN_EVERY_SECONDS = int(os.getenv("SCAN_EVERY_SECONDS", "840"))  # 14 mins
+# ✅ UPDATED: scan every 60 seconds by default (override in Railway env var if you want)
+SCAN_EVERY_SECONDS = int(os.getenv("SCAN_EVERY_SECONDS", "60"))
 
 CONFIDENCE_MIN = 65
 
 # Safety spam guard (rolling hour)
 MAX_SIGNALS_PER_HOUR = 10
-
-# ✅ send signals ONLY on quarter-hour batches (00,15,30,45)
-SEND_BATCH_EVERY_MINUTES = int(os.getenv("SEND_BATCH_EVERY_MINUTES", "15"))  # do not change unless you want different schedule
 
 # Momentum thresholds
 MIN_24H = 1.5
@@ -56,10 +53,6 @@ last_alert_time = {}
 # ✅ RAM spam guard store
 _signal_times = []
 
-# ✅ Pending queue (signals found during scans)
-pending_signals = []
-pending_keys = set()  # (SYM, SIDE) to avoid duplicates within the same batch window
-
 # Memory rules
 MEM_STRICT_MIN_TRADES = 6
 MEM_STRICT_BLOCK_BELOW_WINRATE = 0.30
@@ -72,7 +65,7 @@ MEM_LOOKBACK_DAYS = 14
 COINGECKO_TIMEOUT = 30
 COINGECKO_MAX_RETRIES = 6
 
-# Cache markets briefly (keeps entry fresh, reduces API calls)
+# ✅ UPDATED: cache markets for 60s (keeps entry fresh, reduces API calls)
 MARKETS_CACHE_TTL_SECONDS = int(os.getenv("MARKETS_CACHE_TTL_SECONDS", "60"))
 _last_markets = None
 _last_markets_ts = 0
@@ -87,7 +80,7 @@ TELEGRAM_SEND_RETRIES = 4
 # Requests session
 SESSION = requests.Session()
 SESSION.headers.update({
-    "User-Agent": "brads-trading-bot/2.5 (scan-14min; batch-15min; hourly-summary; whitelist; rate-safe)"
+    "User-Agent": "brads-trading-bot/2.3 (signals-immediate; whitelist; rate-safe)"
 })
 
 # ==============================
@@ -274,6 +267,7 @@ def fetch_binance_klines_usdt(symbol_upper: str, interval="1h", limit=120):
                 delay = min(delay * 2, 20)
                 continue
             if r.status_code == 400:
+                # Pair doesn't exist on Binance
                 return None, None, None
             r.raise_for_status()
             rows = r.json()
@@ -319,7 +313,7 @@ def _atr(highs, lows, closes, period=14):
 def build_levels_from_candles(entry, side, highs, lows, closes):
     """
     Conservative targets based on ATR and recent swing structure,
-    with HARD caps:
+    but with HARD caps on take profits:
       TP1 max = +2%  (or -2% for short)
       TP2 max = +3.5%
       TP3 max = +5%
@@ -522,15 +516,6 @@ def get_win_stats(conn):
 
     return all_time_win_pct, total, last7_win_pct, total7
 
-def count_open_trades(conn):
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM trades WHERE status='OPEN'")
-        n = cur.fetchone()[0]
-        return int(n or 0)
-    except Exception:
-        return 0
-
 # ======================
 # COOLDOWNS + SPAM GUARD
 # ======================
@@ -574,18 +559,16 @@ def should_alert_fallback_ram(symbol, side):
     last_alert_time[key] = now
     return True
 
-def spam_guard_ok(slots=1):
+def spam_guard_ok():
     """
-    ✅ Rolling-hour spam guard.
-    slots = how many signals you're about to add/send.
+    ✅ Rolling-hour spam guard. Keeps Telegram clean even with 60s scanning.
     """
     global _signal_times
     now = time.time()
     _signal_times = [t for t in _signal_times if (now - t) < 3600]
-    if len(_signal_times) + int(slots) > MAX_SIGNALS_PER_HOUR:
+    if len(_signal_times) >= MAX_SIGNALS_PER_HOUR:
         return False
-    for _ in range(int(slots)):
-        _signal_times.append(now)
+    _signal_times.append(now)
     return True
 
 # ======================
@@ -642,17 +625,14 @@ def send_long_message(text):
 # ======================
 # COINGECKO SAFE HTTP
 # ======================
-# ✅ FIXED: always captures a real error message (not None)
 def _get_json_with_backoff(url, params):
     delay = 5
-    last_err = "unknown"
+    last_err = None
 
     for _ in range(COINGECKO_MAX_RETRIES):
         try:
             r = SESSION.get(url, params=params, timeout=COINGECKO_TIMEOUT)
-
             if r.status_code == 429:
-                last_err = "HTTP 429 rate limit"
                 retry_after = r.headers.get("Retry-After")
                 if retry_after:
                     try:
@@ -662,17 +642,10 @@ def _get_json_with_backoff(url, params):
                 time.sleep(delay)
                 delay = min(delay * 2, 120)
                 continue
-
-            if r.status_code >= 400:
-                last_err = f"HTTP {r.status_code}"
-                time.sleep(delay)
-                delay = min(delay * 2, 120)
-                continue
-
+            r.raise_for_status()
             return r.json()
-
         except Exception as e:
-            last_err = str(e)
+            last_err = e
             time.sleep(delay)
             delay = min(delay * 2, 120)
 
@@ -683,13 +656,11 @@ def _chunk_list(items, chunk_size):
     for i in range(0, len(items), chunk_size):
         yield items[i:i + chunk_size]
 
-# ✅ FIXED: if CoinGecko fails, fall back to cached markets (bot keeps running)
 def fetch_whitelist_markets():
     """
     Fetch ONLY the coins in COINGECKO_COIN_IDS.
     Uses CoinGecko /coins/markets with ids=... (chunked for safety).
     Cached to reduce API calls.
-    Falls back to cached data if CoinGecko is rate-limited/down.
     """
     global _last_markets, _last_markets_ts
 
@@ -698,32 +669,25 @@ def fetch_whitelist_markets():
         return _last_markets
 
     url = "https://api.coingecko.com/api/v3/coins/markets"
+
     all_rows = []
+    for chunk in _chunk_list(sorted(COINGECKO_COIN_IDS), 200):
+        params = {
+            "vs_currency": "usd",
+            "ids": ",".join(chunk),
+            "order": "market_cap_desc",
+            "sparkline": "false",
+            "price_change_percentage": "1h,24h",
+            "per_page": len(chunk),
+            "page": 1,
+        }
+        data = _get_json_with_backoff(url, params)
+        if isinstance(data, list):
+            all_rows.extend(data)
 
-    try:
-        for chunk in _chunk_list(sorted(COINGECKO_COIN_IDS), 200):
-            params = {
-                "vs_currency": "usd",
-                "ids": ",".join(chunk),
-                "order": "market_cap_desc",
-                "sparkline": "false",
-                "price_change_percentage": "1h,24h",
-                "per_page": len(chunk),
-                "page": 1,
-            }
-            data = _get_json_with_backoff(url, params)
-            if isinstance(data, list):
-                all_rows.extend(data)
-
-        _last_markets = all_rows
-        _last_markets_ts = now
-        return all_rows
-
-    except Exception as e:
-        print("CoinGecko fallback used:", e)
-        if _last_markets:
-            return _last_markets
-        raise
+    _last_markets = all_rows
+    _last_markets_ts = now
+    return all_rows
 
 def fetch_simple_price_usd(coin_ids):
     if not coin_ids:
@@ -827,13 +791,15 @@ def build_ai_context(coin_name, sym, side, entry, sl, tp1, tp2, tp3, base_conf, 
 def fmt_price(p):
     return f"${p:,.6f}" if p < 1 else f"${p:,.2f}"
 
-def format_signal_msg(coin_name, sym, side, entry, sl, tp1, tp2, tp3, conf, chg1h, chg24, time_str, notes=None):
+def format_signal_msg(coin_name, sym, side, entry, sl, tp1, tp2, tp3, conf, chg1h, chg24, notes=None):
     direction = "🟢 *LONG (BUY)*" if side == "LONG" else "🔴 *SHORT (SELL)*"
     extra = ""
     if notes:
         joined = " | ".join([n for n in notes if n])[:250]
         if joined:
             extra = f"\n🧠 *Notes:* `{joined}`"
+
+    time_str = datetime.now(timezone.utc).strftime("%H:%M UTC")
 
     return (
         f"🚨 *TRADE SIGNAL* 🚨\n"
@@ -849,29 +815,6 @@ def format_signal_msg(coin_name, sym, side, entry, sl, tp1, tp2, tp3, conf, chg1
         f"━━━━━━━━━━━━━━\n"
         f"📈 *Momentum:* 1h `{chg1h:+.2f}%` | 24h `{chg24:+.2f}%`\n"
         f"{extra}\n"
-        f"_Not financial advice_"
-    )
-
-def format_quarter_header(conn, time_str):
-    all_win, all_total, win7, total7 = get_win_stats(conn)
-    open_n = count_open_trades(conn)
-    return (
-        f"⏱ *15-Min Signal Batch* ({time_str})\n"
-        f"📊 *Win Rate:* All-time `{all_win:.1f}%` ({all_total} trades) | Last 7D `{win7:.1f}%` ({total7} trades)\n"
-        f"🟦 *Open Trades:* `{open_n}`\n"
-        f"━━━━━━━━━━━━━━"
-    )
-
-def format_hourly_summary(conn, time_str):
-    all_win, all_total, win7, total7 = get_win_stats(conn)
-    open_n = count_open_trades(conn)
-    queued = len(pending_signals)
-    return (
-        f"🧠 *Hourly Market Scan Summary* ({time_str})\n"
-        f"📊 *Win Rate:* All-time `{all_win:.1f}%` ({all_total} trades) | Last 7D `{win7:.1f}%` ({total7} trades)\n"
-        f"🟦 *Open Trades:* `{open_n}`\n"
-        f"📥 *Queued Signals (next batch):* `{queued}`\n"
-        f"━━━━━━━━━━━━━━\n"
         f"_Not financial advice_"
     )
 
@@ -917,13 +860,10 @@ def update_open_trades(conn):
                 close_trade(conn, trade_id, "WIN")
 
 # ======================
-# SCAN + QUEUE (WHITELIST ONLY)
+# SCAN + SEND IMMEDIATELY (WHITELIST ONLY)
 # ======================
-def scan_and_queue(conn):
-    global pending_signals, pending_keys
-
+def scan_and_send(conn):
     markets = fetch_whitelist_markets()
-    now_str = datetime.now(timezone.utc).strftime("%H:%M UTC")
     ts_iso = datetime.now(timezone.utc).isoformat()
     cooldown_cache = load_cooldowns(conn)
 
@@ -951,7 +891,7 @@ def scan_and_queue(conn):
         if not sym:
             continue
 
-        # cooldown (DB; RAM fallback)
+        # cooldown
         try:
             if not cooldown_ok(sym, side, cooldown_cache):
                 continue
@@ -959,11 +899,11 @@ def scan_and_queue(conn):
             if not should_alert_fallback_ram(sym, side):
                 continue
 
-        key = (sym, side)
-        if key in pending_keys:
+        # spam guard
+        if not spam_guard_ok():
             continue
 
-        # base confidence + memory BEFORE Binance
+        # base confidence + memory BEFORE Binance (reduce API hits)
         conf = score(chg24, chg1h)
         blocked, mem_delta, mem_note = apply_memory_rules(conn, sym, side)
         if blocked:
@@ -980,6 +920,7 @@ def scan_and_queue(conn):
         # Levels (Binance first)
         highs, lows, closes = fetch_binance_klines_usdt(sym, interval="1h", limit=120)
         levels = build_levels_from_candles(entry, side, highs, lows, closes)
+
         atr_val = _atr(highs, lows, closes, period=14) if levels else None
 
         # CoinGecko fallback if Binance not available
@@ -1065,92 +1006,15 @@ def scan_and_queue(conn):
         if final_conf < CONFIDENCE_MIN:
             continue
 
-        # queue cap (also protects memory + telegram)
-        if len(pending_signals) >= MAX_SIGNALS_PER_HOUR:
-            break
-
-        # reserve spam slots NOW (so we don't queue 50 then fail to send)
-        if not spam_guard_ok(slots=1):
-            continue
-
-        # persist cooldown BEFORE queue (prevents duplicates on restart)
+        # persist cooldown BEFORE sending (prevents duplicates on restart)
         set_cooldown(conn, sym, side, cooldown_cache)
 
-        # save trade immediately (keeps DB consistent even if send happens later)
+        # save trade
         insert_trade(conn, ts_iso, sym, coin_id, coin_name, side, entry, sl, tp1, tp2, tp3, final_conf, chg1h, chg24)
 
-        pending_keys.add(key)
-        pending_signals.append(
-            format_signal_msg(coin_name, sym, side, entry, sl, tp1, tp2, tp3, final_conf, chg1h, chg24, now_str, notes=notes)
-        )
-
-# ======================
-# SCHEDULED SENDERS
-# ======================
-_last_quarter_key = None
-_last_hour_key = None
-
-def _current_quarter_key(dt: datetime) -> str:
-    minute_bucket = (dt.minute // SEND_BATCH_EVERY_MINUTES) * SEND_BATCH_EVERY_MINUTES
-    return dt.strftime("%Y-%m-%d %H:") + f"{minute_bucket:02d}"
-
-def should_send_quarter_batch():
-    global _last_quarter_key
-    now = datetime.now(timezone.utc)
-
-    if SEND_BATCH_EVERY_MINUTES <= 0:
-        return False
-
-    aligned = (now.minute % SEND_BATCH_EVERY_MINUTES == 0)
-    if not aligned:
-        return False
-
-    if now.second > 8:
-        return False
-
-    qkey = _current_quarter_key(now)
-    if qkey == _last_quarter_key:
-        return False
-
-    _last_quarter_key = qkey
-    return True
-
-def send_quarter_batch(conn):
-    global pending_signals, pending_keys
-
-    now_str = datetime.now(timezone.utc).strftime("%H:%M UTC")
-    header = format_quarter_header(conn, now_str)
-
-    if pending_signals:
-        body = "\n\n".join(pending_signals)
-        msg = f"{header}\n\n{body}"
-        send_long_message(msg)
-    else:
-        send_message(f"{header}\n\n❌ *No signals in the last 15 minutes.*\n\n_Not financial advice_")
-
-    pending_signals = []
-    pending_keys = set()
-
-def should_send_hourly_summary():
-    global _last_hour_key
-    now = datetime.now(timezone.utc)
-
-    if now.minute != 0:
-        return False
-    if now.second > 10:
-        return False
-
-    hour_key = now.strftime("%Y-%m-%d %H")
-    if hour_key == _last_hour_key:
-        return False
-
-    _last_hour_key = hour_key
-    return True
-
-def send_hourly_summary(conn):
-    now_str = datetime.now(timezone.utc).strftime("%H:%M UTC")
-    msg = format_hourly_summary(conn, now_str)
-    send_message(msg)
+        # send immediately
+        msg = format_signal_msg(coin_name, sym, side, entry, sl, tp1, tp2, tp3, final_conf, chg1h, chg24, notes=notes)
+        send_message(msg)
 
 # ======================
 # MAIN LOOP
@@ -1167,8 +1031,7 @@ def main():
     ai_status = "ON ✅" if ai_enabled() else "OFF (no OPENAI_API_KEY) ⚠️"
     send_message(
         "✅ Bot online. Scanning 24/7.\n"
-        "⏳ Signals are queued and sent every 15 minutes (00/15/30/45).\n"
-        "🧠 Hourly market scan summary sent on the hour.\n"
+        "⚡ Signals send immediately when found.\n"
         f"⏱ Scan interval: {SCAN_EVERY_SECONDS}s\n"
         f"🎯 Confidence Filter: {CONFIDENCE_MIN}+\n"
         f"🤖 AI Filter: {ai_status}\n"
@@ -1186,21 +1049,9 @@ def main():
             print("update_open_trades error:", e)
 
         try:
-            scan_and_queue(conn)
+            scan_and_send(conn)
         except Exception as e:
-            print("scan_and_queue error:", e)
-
-        try:
-            if should_send_quarter_batch():
-                send_quarter_batch(conn)
-        except Exception as e:
-            print("quarter_batch_send error:", e)
-
-        try:
-            if should_send_hourly_summary():
-                send_hourly_summary(conn)
-        except Exception as e:
-            print("hourly_summary_send error:", e)
+            print("scan_and_send error:", e)
 
         time.sleep(SCAN_EVERY_SECONDS)
 
