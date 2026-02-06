@@ -23,21 +23,14 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# ✅ OPTIONAL: set to "1" ONE TIME if you want to wipe trade history + reset win-rate stats to 0
-RESET_STATS_ON_START = os.getenv("RESET_STATS_ON_START", "0") == "1"
-
 if not BOT_TOKEN or not CHAT_ID or not DATABASE_URL:
     raise RuntimeError("BOT_TOKEN, CHAT_ID, or DATABASE_URL missing")
 
 # ======================
 # SETTINGS
 # ======================
-# ✅ UPDATED: scan every 60 seconds by default (override in Railway env var if you want)
-SCAN_EVERY_SECONDS = int(os.getenv("SCAN_EVERY_SECONDS", "60"))
-
+SCAN_EVERY_SECONDS = 600          # scan every 10 minutes
 CONFIDENCE_MIN = 65
-
-# Safety spam guard (rolling hour)
 MAX_SIGNALS_PER_HOUR = 10
 
 # Momentum thresholds
@@ -50,8 +43,9 @@ ALERT_COOLDOWN_SECONDS = 60 * 60  # 1 hour
 # In-memory fallback cooldown
 last_alert_time = {}
 
-# ✅ RAM spam guard store
-_signal_times = []
+# Pending hourly bucket
+pending_signals = []
+pending_keys = set()
 
 # Memory rules
 MEM_STRICT_MIN_TRADES = 6
@@ -65,8 +59,7 @@ MEM_LOOKBACK_DAYS = 14
 COINGECKO_TIMEOUT = 30
 COINGECKO_MAX_RETRIES = 6
 
-# ✅ UPDATED: cache markets for 60s (keeps entry fresh, reduces API calls)
-MARKETS_CACHE_TTL_SECONDS = int(os.getenv("MARKETS_CACHE_TTL_SECONDS", "60"))
+MARKETS_CACHE_TTL_SECONDS = 20 * 60
 _last_markets = None
 _last_markets_ts = 0
 
@@ -80,7 +73,7 @@ TELEGRAM_SEND_RETRIES = 4
 # Requests session
 SESSION = requests.Session()
 SESSION.headers.update({
-    "User-Agent": "brads-trading-bot/2.3 (signals-immediate; whitelist; rate-safe)"
+    "User-Agent": "brads-trading-bot/2.2 (signals-only; whitelist; rate-safe)"
 })
 
 # ==============================
@@ -314,9 +307,12 @@ def build_levels_from_candles(entry, side, highs, lows, closes):
     """
     Conservative targets based on ATR and recent swing structure,
     but with HARD caps on take profits:
+
       TP1 max = +2%  (or -2% for short)
       TP2 max = +3.5%
       TP3 max = +5%
+
+    This keeps targets realistic and prevents huge ATR-driven jumps.
     """
     if entry is None or highs is None or lows is None or closes is None:
         return None
@@ -329,6 +325,7 @@ def build_levels_from_candles(entry, side, highs, lows, closes):
     recent_high = max(highs[-lookback:])
     recent_low = min(lows[-lookback:])
 
+    # HARD TP caps
     TP1_CAP = 0.02
     TP2_CAP = 0.035
     TP3_CAP = 0.05
@@ -455,16 +452,6 @@ def db_connect():
     conn.commit()
     return conn
 
-def reset_stats(conn):
-    """
-    ✅ Resets win-rate stats to 0 by wiping trade history + cooldowns.
-    Use RESET_STATS_ON_START=1 ONE TIME, then set it back to 0.
-    """
-    cur = conn.cursor()
-    cur.execute("TRUNCATE TABLE trades RESTART IDENTITY")
-    cur.execute("TRUNCATE TABLE cooldowns")
-    conn.commit()
-
 def insert_trade(conn, ts_utc, symbol, coin_id, coin_name, side, entry, sl, tp1, tp2, tp3, conf, chg1h, chg24):
     cur = conn.cursor()
     cur.execute("""
@@ -517,7 +504,7 @@ def get_win_stats(conn):
     return all_time_win_pct, total, last7_win_pct, total7
 
 # ======================
-# COOLDOWNS + SPAM GUARD
+# COOLDOWNS
 # ======================
 def load_cooldowns(conn):
     try:
@@ -557,18 +544,6 @@ def should_alert_fallback_ram(symbol, side):
     if now - last_alert_time.get(key, 0) < ALERT_COOLDOWN_SECONDS:
         return False
     last_alert_time[key] = now
-    return True
-
-def spam_guard_ok():
-    """
-    ✅ Rolling-hour spam guard. Keeps Telegram clean even with 60s scanning.
-    """
-    global _signal_times
-    now = time.time()
-    _signal_times = [t for t in _signal_times if (now - t) < 3600]
-    if len(_signal_times) >= MAX_SIGNALS_PER_HOUR:
-        return False
-    _signal_times.append(now)
     return True
 
 # ======================
@@ -670,6 +645,7 @@ def fetch_whitelist_markets():
 
     url = "https://api.coingecko.com/api/v3/coins/markets"
 
+    # CoinGecko supports ids=comma-separated. Keep chunks <= 200.
     all_rows = []
     for chunk in _chunk_list(sorted(COINGECKO_COIN_IDS), 200):
         params = {
@@ -791,15 +767,13 @@ def build_ai_context(coin_name, sym, side, entry, sl, tp1, tp2, tp3, base_conf, 
 def fmt_price(p):
     return f"${p:,.6f}" if p < 1 else f"${p:,.2f}"
 
-def format_signal_msg(coin_name, sym, side, entry, sl, tp1, tp2, tp3, conf, chg1h, chg24, notes=None):
+def format_signal_msg(coin_name, sym, side, entry, sl, tp1, tp2, tp3, conf, chg1h, chg24, time_str, notes=None):
     direction = "🟢 *LONG (BUY)*" if side == "LONG" else "🔴 *SHORT (SELL)*"
     extra = ""
     if notes:
         joined = " | ".join([n for n in notes if n])[:250]
         if joined:
             extra = f"\n🧠 *Notes:* `{joined}`"
-
-    time_str = datetime.now(timezone.utc).strftime("%H:%M UTC")
 
     return (
         f"🚨 *TRADE SIGNAL* 🚨\n"
@@ -816,6 +790,14 @@ def format_signal_msg(coin_name, sym, side, entry, sl, tp1, tp2, tp3, conf, chg1
         f"📈 *Momentum:* 1h `{chg1h:+.2f}%` | 24h `{chg24:+.2f}%`\n"
         f"{extra}\n"
         f"_Not financial advice_"
+    )
+
+def format_hourly_header(conn, time_str):
+    all_win, all_total, win7, total7 = get_win_stats(conn)
+    return (
+        f"🧠 *Hourly Market Scan* ({time_str})\n"
+        f"📊 *Win Rate:* All-time `{all_win:.1f}%` ({all_total} trades) | Last 7D `{win7:.1f}%` ({total7} trades)\n"
+        f"━━━━━━━━━━━━━━"
     )
 
 # ======================
@@ -860,14 +842,18 @@ def update_open_trades(conn):
                 close_trade(conn, trade_id, "WIN")
 
 # ======================
-# SCAN + SEND IMMEDIATELY (WHITELIST ONLY)
+# SCAN + COLLECT (WHITELIST ONLY)
 # ======================
-def scan_and_send(conn):
+def scan_and_collect(conn):
+    global pending_signals, pending_keys
+
     markets = fetch_whitelist_markets()
+    now_str = datetime.now(timezone.utc).strftime("%H:%M UTC")
     ts_iso = datetime.now(timezone.utc).isoformat()
     cooldown_cache = load_cooldowns(conn)
 
     for c in markets:
+        # extra safety: ensure it is in whitelist
         coin_id = c.get("id")
         if not coin_id or coin_id not in COINGECKO_COIN_IDS:
             continue
@@ -899,16 +885,15 @@ def scan_and_send(conn):
             if not should_alert_fallback_ram(sym, side):
                 continue
 
-        # spam guard
-        if not spam_guard_ok():
+        key = (sym, side)
+        if key in pending_keys:
             continue
 
-        # base confidence + memory BEFORE Binance (reduce API hits)
+        # base confidence + memory (do these BEFORE Binance to reduce API hits)
         conf = score(chg24, chg1h)
         blocked, mem_delta, mem_note = apply_memory_rules(conn, sym, side)
         if blocked:
             continue
-
         conf_after_mem = max(0, min(100, conf + mem_delta))
         if conf_after_mem < CONFIDENCE_MIN:
             continue
@@ -917,11 +902,15 @@ def scan_and_send(conn):
         if mem_note:
             notes.append(mem_note)
 
-        # Levels (Binance first)
+        # ---------------------------
+        # Build realistic levels (Binance FIRST, but only for passing candidates)
+        # ---------------------------
         highs, lows, closes = fetch_binance_klines_usdt(sym, interval="1h", limit=120)
         levels = build_levels_from_candles(entry, side, highs, lows, closes)
 
-        atr_val = _atr(highs, lows, closes, period=14) if levels else None
+        atr_val = None
+        if levels:
+            atr_val = _atr(highs, lows, closes, period=14)
 
         # CoinGecko fallback if Binance not available
         if not levels:
@@ -930,6 +919,7 @@ def scan_and_send(conn):
             if high_24h is None or low_24h is None or high_24h <= 0 or low_24h <= 0:
                 continue
 
+            # HARD caps (same as candle logic)
             TP1_CAP = 0.02
             TP2_CAP = 0.035
             TP3_CAP = 0.05
@@ -939,20 +929,29 @@ def scan_and_send(conn):
                 if sl >= entry:
                     continue
 
-                tp1 = min(entry * (1.0 + TP1_CAP), high_24h * 0.995)
-                tp2 = min(entry * (1.0 + TP2_CAP), high_24h * 1.000)
-                tp3 = min(entry * (1.0 + TP3_CAP), high_24h * 1.005)
+                tp1 = entry * (1.0 + TP1_CAP)
+                tp2 = entry * (1.0 + TP2_CAP)
+                tp3 = entry * (1.0 + TP3_CAP)
+
+                tp1 = min(tp1, high_24h * 0.995)
+                tp2 = min(tp2, high_24h * 1.000)
+                tp3 = min(tp3, high_24h * 1.005)
 
                 if not (sl < entry < tp1 < tp2 < tp3):
                     continue
+
             else:
                 sl = high_24h * 1.003
                 if sl <= entry:
                     continue
 
-                tp1 = max(entry * (1.0 - TP1_CAP), low_24h * 1.005)
-                tp2 = max(entry * (1.0 - TP2_CAP), low_24h * 1.000)
-                tp3 = max(entry * (1.0 - TP3_CAP), low_24h * 0.995)
+                tp1 = entry * (1.0 - TP1_CAP)
+                tp2 = entry * (1.0 - TP2_CAP)
+                tp3 = entry * (1.0 - TP3_CAP)
+
+                tp1 = max(tp1, low_24h * 1.005)
+                tp2 = max(tp2, low_24h * 1.000)
+                tp3 = max(tp3, low_24h * 0.995)
 
                 if not (tp3 < tp2 < tp1 < entry < sl):
                     continue
@@ -961,7 +960,9 @@ def scan_and_send(conn):
 
         sl, tp1, tp2, tp3 = levels
 
-        # AI layer (fail-safe)
+        # ----------------------
+        # AI Layer (fail-safe)
+        # ----------------------
         final_conf = conf_after_mem
         if ai_enabled():
             try:
@@ -989,6 +990,7 @@ def scan_and_send(conn):
 
                 final_conf = max(0, min(100, conf_after_mem + int(adj)))
 
+                # Only accept AI TP/SL if ATR available
                 if atr_val is not None:
                     sl, tp1, tp2, tp3 = validate_ai_levels(
                         side=side,
@@ -1006,15 +1008,43 @@ def scan_and_send(conn):
         if final_conf < CONFIDENCE_MIN:
             continue
 
-        # persist cooldown BEFORE sending (prevents duplicates on restart)
+        # persist cooldown
         set_cooldown(conn, sym, side, cooldown_cache)
 
-        # save trade
+        # save + collect
         insert_trade(conn, ts_iso, sym, coin_id, coin_name, side, entry, sl, tp1, tp2, tp3, final_conf, chg1h, chg24)
 
-        # send immediately
-        msg = format_signal_msg(coin_name, sym, side, entry, sl, tp1, tp2, tp3, final_conf, chg1h, chg24, notes=notes)
-        send_message(msg)
+        pending_keys.add(key)
+        pending_signals.append(
+            format_signal_msg(coin_name, sym, side, entry, sl, tp1, tp2, tp3, final_conf, chg1h, chg24, now_str, notes=notes)
+        )
+
+        if len(pending_signals) >= MAX_SIGNALS_PER_HOUR:
+            break
+
+# ======================
+# HOURLY SEND
+# ======================
+def should_send_now(last_sent_hour):
+    now = datetime.now(timezone.utc)
+    hour_key = now.strftime("%Y-%m-%d %H")
+    return (hour_key != last_sent_hour), hour_key
+
+def send_hourly_update(conn):
+    global pending_signals, pending_keys
+
+    now_str = datetime.now(timezone.utc).strftime("%H:%M UTC")
+    header = format_hourly_header(conn, now_str)
+
+    if pending_signals:
+        body = "\n\n".join(pending_signals)
+        msg = f"{header}\n\n{body}"
+        send_long_message(msg)
+    else:
+        send_message(f"{header}\n\n❌ *No coins worth investing in.*\n\n_Not financial advice_")
+
+    pending_signals = []
+    pending_keys = set()
 
 # ======================
 # MAIN LOOP
@@ -1022,25 +1052,19 @@ def scan_and_send(conn):
 def main():
     conn = db_connect()
 
-    if RESET_STATS_ON_START:
-        try:
-            reset_stats(conn)
-        except Exception as e:
-            print("reset_stats error:", e)
-
     ai_status = "ON ✅" if ai_enabled() else "OFF (no OPENAI_API_KEY) ⚠️"
     send_message(
-        "✅ Bot online. Scanning 24/7.\n"
-        "⚡ Signals send immediately when found.\n"
-        f"⏱ Scan interval: {SCAN_EVERY_SECONDS}s\n"
-        f"🎯 Confidence Filter: {CONFIDENCE_MIN}+\n"
+        "✅ Bot online. Analysing 24/7.\n"
+        "⏳ Signals are sent once per hour.\n"
         f"🤖 AI Filter: {ai_status}\n"
         f"🧾 CoinGecko Whitelist: {len(COINGECKO_COIN_IDS)} coins ✅\n"
         "🧠 Decision Memory: ON ✅\n"
         "🕒 Persistent Cooldowns: ON ✅\n"
-        f"🧯 Spam Guard: max {MAX_SIGNALS_PER_HOUR}/hour\n"
+        "📩 Telegram Chunking: ON ✅\n"
         "_Not financial advice_"
     )
+
+    last_sent_hour = None
 
     while True:
         try:
@@ -1049,9 +1073,16 @@ def main():
             print("update_open_trades error:", e)
 
         try:
-            scan_and_send(conn)
+            scan_and_collect(conn)
         except Exception as e:
-            print("scan_and_send error:", e)
+            print("scan_and_collect error:", e)
+
+        try:
+            do_send, last_sent_hour = should_send_now(last_sent_hour)
+            if do_send:
+                send_hourly_update(conn)
+        except Exception as e:
+            print("hourly_send error:", e)
 
         time.sleep(SCAN_EVERY_SECONDS)
 
