@@ -30,7 +30,6 @@ if not BOT_TOKEN or not CHAT_ID or not DATABASE_URL:
 # SETTINGS
 # ======================
 SCAN_EVERY_SECONDS = 600          # scan every 10 minutes
-TOP_N_COINS = 150                 # Top N CoinGecko
 CONFIDENCE_MIN = 65
 MAX_SIGNALS_PER_HOUR = 10
 
@@ -74,8 +73,160 @@ TELEGRAM_SEND_RETRIES = 4
 # Requests session
 SESSION = requests.Session()
 SESSION.headers.update({
-    "User-Agent": "brads-trading-bot/2.1 (signals-only; rate-safe)"
+    "User-Agent": "brads-trading-bot/2.2 (signals-only; whitelist; rate-safe)"
 })
+
+# ==============================
+# COINGECKO WHITELIST (YOUR LIST)
+# ==============================
+COINGECKO_COIN_IDS = {
+    # Majors / L1
+    "bitcoin",
+    "ethereum",
+    "binancecoin",
+    "ripple",
+    "solana",
+    "cardano",
+    "dogecoin",
+    "tron",
+    "bitcoin-cash",
+    "litecoin",
+    "polkadot",
+    "avalanche-2",
+    "cosmos",
+    "stellar",
+    "ethereum-classic",
+    "internet-computer",
+    "near",
+    "algorand",
+    "aptos",
+    "filecoin",
+    "vechain",
+    "hedera-hashgraph",
+    "zcash",
+    "monero",
+
+    # DeFi / Core Infra
+    "chainlink",
+    "uniswap",
+    "aave",
+    "pancakeswap-token",
+    "curve-dao-token",
+    "synthetix-network-token",
+    "compound-governance-token",
+    "injective-protocol",
+    "lido-dao",
+    "morpho",
+    "dydx",
+    "the-graph",
+    "reserve-rights-token",
+    "qtum",
+    "kyber-network-crystal",
+    "loopring",
+    "bancor",
+    "0x",
+    "gnosis",
+    "band-protocol",
+
+    # Layer 2 / Scaling / Modular
+    "arbitrum",
+    "optimism",
+    "stacks",
+    "starknet",
+    "layerzero",
+    "celestia",
+    "skale",
+    "osmosis",
+
+    # AI / Compute / Data
+    "bittensor",
+    "render-token",
+    "fetch-ai",
+    "io-net",
+    "numeraire",
+
+    # Memes
+    "shiba-inu",
+    "pepe",
+    "bonk",
+    "floki",
+    "dogwifcoin",
+    "cheems-token",
+    "book-of-meme",
+    "peanut-the-squirrel",
+    "official-trump",
+
+    # Exchange / Wallet Tokens
+    "trust-wallet-token",
+    "nexo",
+    "kucoin-shares",
+    "okb",
+    "gatechain-token",
+    "htx",
+    "mx-token",
+    "bitget-token",
+
+    # Payments / Utility / Legacy
+    "xdc-network",
+    "iota",
+    "dash",
+    "horizen",
+    "siacoin",
+    "holo",
+    "ravencoin",
+    "verge",
+    "zilliqa",
+    "theta-fuel",
+    "theta-token",
+    "basic-attention-token",
+
+    # Gaming / NFT / Metaverse
+    "axie-infinity",
+    "apecoin",
+    "the-sandbox",
+    "gala",
+    "immutable-x",
+    "yield-guild-games",
+    "open-campus",
+
+    # Stables (shared + liquid)
+    "tether",
+    "usd-coin",
+    "dai",
+    "true-usd",
+    "first-digital-usd",
+    "ethena-usde",
+    "ripple-usd",
+    "frax",
+    "paypal-usd",
+
+    # Other Valid Overlaps
+    "jasmycoin",
+    "kite",
+    "walrus",
+    "sonic",
+    "safepal",
+    "space-id",
+    "magic-eden",
+    "power-ledger",
+    "audius",
+    "flux",
+    "ontology-gas",
+    "saga",
+    "origin-protocol",
+    "civic",
+    "everipedia",
+    "stratis",
+    "wax",
+    "cyberconnect",
+    "amp-token",
+    "oasis-network",
+    "livepeer",
+    "gas",
+    "wormhole",
+    "elrond-erd-2",
+    "eigenlayer"
+}
 
 # ======================
 # BINANCE CANDLE DATA (throttled)
@@ -174,7 +325,7 @@ def build_levels_from_candles(entry, side, highs, lows, closes):
     recent_high = max(highs[-lookback:])
     recent_low = min(lows[-lookback:])
 
-    # HARD TP caps (your request)
+    # HARD TP caps
     TP1_CAP = 0.02
     TP2_CAP = 0.035
     TP3_CAP = 0.05
@@ -182,27 +333,22 @@ def build_levels_from_candles(entry, side, highs, lows, closes):
     if side == "LONG":
         sl = min(entry - 1.10 * atr, recent_low - 0.20 * atr)
 
-        # Original ATR-based ladder (good structure)
         tp1_atr = entry + 0.60 * atr
         tp2_atr = entry + 1.00 * atr
         tp3_atr = entry + 1.40 * atr
 
-        # Hard percent caps (max distance)
         tp1_cap = entry * (1.0 + TP1_CAP)
         tp2_cap = entry * (1.0 + TP2_CAP)
         tp3_cap = entry * (1.0 + TP3_CAP)
 
-        # Apply cap first
         tp1 = min(tp1_atr, tp1_cap)
         tp2 = min(tp2_atr, tp2_cap)
         tp3 = min(tp3_atr, tp3_cap)
 
-        # Respect resistance structure
         tp1 = min(tp1, recent_high * 0.995)
         tp2 = min(tp2, recent_high * 1.000)
         tp3 = min(tp3, recent_high * 1.005)
 
-        # Ensure strict ordering (avoid equal/invalid)
         if not (sl < entry < tp1 < tp2 < tp3):
             return None
         return sl, tp1, tp2, tp3
@@ -218,12 +364,10 @@ def build_levels_from_candles(entry, side, highs, lows, closes):
         tp2_cap = entry * (1.0 - TP2_CAP)
         tp3_cap = entry * (1.0 - TP3_CAP)
 
-        # For shorts: tp is below entry, "cap" means not too far down
         tp1 = max(tp1_atr, tp1_cap)
         tp2 = max(tp2_atr, tp2_cap)
         tp3 = max(tp3_atr, tp3_cap)
 
-        # Respect support structure
         tp1 = max(tp1, recent_low * 1.005)
         tp2 = max(tp2, recent_low * 1.000)
         tp3 = max(tp3, recent_low * 0.995)
@@ -482,7 +626,17 @@ def _get_json_with_backoff(url, params):
 
     raise RuntimeError(f"CoinGecko request failed after retries: {last_err}")
 
-def fetch_top_markets(top_n=150):
+def _chunk_list(items, chunk_size):
+    items = list(items)
+    for i in range(0, len(items), chunk_size):
+        yield items[i:i + chunk_size]
+
+def fetch_whitelist_markets():
+    """
+    Fetch ONLY the coins in COINGECKO_COIN_IDS.
+    Uses CoinGecko /coins/markets with ids=... (chunked for safety).
+    Cached to reduce API calls.
+    """
     global _last_markets, _last_markets_ts
 
     now = time.time()
@@ -490,19 +644,26 @@ def fetch_top_markets(top_n=150):
         return _last_markets
 
     url = "https://api.coingecko.com/api/v3/coins/markets"
-    params = {
-        "vs_currency": "usd",
-        "order": "market_cap_desc",
-        "sparkline": "false",
-        "price_change_percentage": "1h,24h",
-        "per_page": top_n,
-        "page": 1,
-    }
 
-    data = _get_json_with_backoff(url, params)
-    _last_markets = data
+    # CoinGecko supports ids=comma-separated. Keep chunks <= 200.
+    all_rows = []
+    for chunk in _chunk_list(sorted(COINGECKO_COIN_IDS), 200):
+        params = {
+            "vs_currency": "usd",
+            "ids": ",".join(chunk),
+            "order": "market_cap_desc",
+            "sparkline": "false",
+            "price_change_percentage": "1h,24h",
+            "per_page": len(chunk),
+            "page": 1,
+        }
+        data = _get_json_with_backoff(url, params)
+        if isinstance(data, list):
+            all_rows.extend(data)
+
+    _last_markets = all_rows
     _last_markets_ts = now
-    return data
+    return all_rows
 
 def fetch_simple_price_usd(coin_ids):
     if not coin_ids:
@@ -681,17 +842,22 @@ def update_open_trades(conn):
                 close_trade(conn, trade_id, "WIN")
 
 # ======================
-# SCAN + COLLECT (BINANCE THROTTLED)
+# SCAN + COLLECT (WHITELIST ONLY)
 # ======================
 def scan_and_collect(conn):
     global pending_signals, pending_keys
 
-    markets = fetch_top_markets(TOP_N_COINS)
+    markets = fetch_whitelist_markets()
     now_str = datetime.now(timezone.utc).strftime("%H:%M UTC")
     ts_iso = datetime.now(timezone.utc).isoformat()
     cooldown_cache = load_cooldowns(conn)
 
     for c in markets:
+        # extra safety: ensure it is in whitelist
+        coin_id = c.get("id")
+        if not coin_id or coin_id not in COINGECKO_COIN_IDS:
+            continue
+
         chg1h = c.get("price_change_percentage_1h_in_currency")
         chg24 = c.get("price_change_percentage_24h")
         entry = c.get("current_price")
@@ -707,9 +873,8 @@ def scan_and_collect(conn):
             continue
 
         sym = (c.get("symbol") or "").upper()
-        coin_id = c.get("id")
         coin_name = c.get("name") or sym
-        if not sym or not coin_id:
+        if not sym:
             continue
 
         # cooldown
@@ -764,12 +929,10 @@ def scan_and_collect(conn):
                 if sl >= entry:
                     continue
 
-                # capped percent targets
                 tp1 = entry * (1.0 + TP1_CAP)
                 tp2 = entry * (1.0 + TP2_CAP)
                 tp3 = entry * (1.0 + TP3_CAP)
 
-                # respect 24h high
                 tp1 = min(tp1, high_24h * 0.995)
                 tp2 = min(tp2, high_24h * 1.000)
                 tp3 = min(tp3, high_24h * 1.005)
@@ -786,7 +949,6 @@ def scan_and_collect(conn):
                 tp2 = entry * (1.0 - TP2_CAP)
                 tp3 = entry * (1.0 - TP3_CAP)
 
-                # respect 24h low
                 tp1 = max(tp1, low_24h * 1.005)
                 tp2 = max(tp2, low_24h * 1.000)
                 tp3 = max(tp3, low_24h * 0.995)
@@ -895,6 +1057,7 @@ def main():
         "✅ Bot online. Analysing 24/7.\n"
         "⏳ Signals are sent once per hour.\n"
         f"🤖 AI Filter: {ai_status}\n"
+        f"🧾 CoinGecko Whitelist: {len(COINGECKO_COIN_IDS)} coins ✅\n"
         "🧠 Decision Memory: ON ✅\n"
         "🕒 Persistent Cooldowns: ON ✅\n"
         "📩 Telegram Chunking: ON ✅\n"
