@@ -23,8 +23,15 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
+# ✅ CoinGecko Pro (Basic/Analyst both use the same auth header)
+COINGECKO_API_KEY = os.getenv("COINGECKO_API_KEY")
+COINGECKO_BASE_URL = os.getenv("COINGECKO_BASE_URL", "https://pro-api.coingecko.com/api/v3").rstrip("/")
+
 if not BOT_TOKEN or not CHAT_ID or not DATABASE_URL:
     raise RuntimeError("BOT_TOKEN, CHAT_ID, or DATABASE_URL missing")
+
+if not COINGECKO_API_KEY:
+    raise RuntimeError("COINGECKO_API_KEY missing (set Railway Variable COINGECKO_API_KEY)")
 
 # ======================
 # SETTINGS
@@ -73,7 +80,10 @@ TELEGRAM_SEND_RETRIES = 4
 # Requests session
 SESSION = requests.Session()
 SESSION.headers.update({
-    "User-Agent": "brads-trading-bot/2.2 (signals-only; whitelist; rate-safe)"
+    "User-Agent": "brads-trading-bot/2.2 (signals-only; whitelist; rate-safe)",
+    "accept": "application/json",
+    # ✅ CoinGecko Pro key is sent via header (NOT in URL)
+    "x-cg-pro-api-key": COINGECKO_API_KEY
 })
 
 # ==============================
@@ -307,12 +317,9 @@ def build_levels_from_candles(entry, side, highs, lows, closes):
     """
     Conservative targets based on ATR and recent swing structure,
     but with HARD caps on take profits:
-
       TP1 max = +2%  (or -2% for short)
       TP2 max = +3.5%
       TP3 max = +5%
-
-    This keeps targets realistic and prevents huge ATR-driven jumps.
     """
     if entry is None or highs is None or lows is None or closes is None:
         return None
@@ -607,6 +614,11 @@ def _get_json_with_backoff(url, params):
     for _ in range(COINGECKO_MAX_RETRIES):
         try:
             r = SESSION.get(url, params=params, timeout=COINGECKO_TIMEOUT)
+
+            # Helpful errors when using Pro
+            if r.status_code == 401:
+                raise RuntimeError("CoinGecko 401 Unauthorized (check COINGECKO_API_KEY / plan / base URL)")
+
             if r.status_code == 429:
                 retry_after = r.headers.get("Retry-After")
                 if retry_after:
@@ -617,6 +629,7 @@ def _get_json_with_backoff(url, params):
                 time.sleep(delay)
                 delay = min(delay * 2, 120)
                 continue
+
             r.raise_for_status()
             return r.json()
         except Exception as e:
@@ -643,7 +656,8 @@ def fetch_whitelist_markets():
     if _last_markets and (now - _last_markets_ts) < MARKETS_CACHE_TTL_SECONDS:
         return _last_markets
 
-    url = "https://api.coingecko.com/api/v3/coins/markets"
+    # ✅ Pro base URL
+    url = f"{COINGECKO_BASE_URL}/coins/markets"
 
     # CoinGecko supports ids=comma-separated. Keep chunks <= 200.
     all_rows = []
@@ -669,7 +683,10 @@ def fetch_simple_price_usd(coin_ids):
     if not coin_ids:
         return {}
     coin_ids = list(dict.fromkeys(coin_ids))[:200]
-    url = "https://api.coingecko.com/api/v3/simple/price"
+
+    # ✅ Pro base URL
+    url = f"{COINGECKO_BASE_URL}/simple/price"
+
     params = {"ids": ",".join(coin_ids), "vs_currencies": "usd"}
     data = _get_json_with_backoff(url, params)
     return {k: v.get("usd") for k, v in data.items()}
