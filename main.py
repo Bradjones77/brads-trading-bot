@@ -23,16 +23,8 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# CoinGecko Pro (Analyst)
-COINGECKO_API_KEY = os.getenv("COINGECKO_API_KEY")
-COINGECKO_BASE_URL = os.getenv("COINGECKO_BASE_URL", "https://pro-api.coingecko.com/api/v3").rstrip("/")
-
 if not BOT_TOKEN or not CHAT_ID or not DATABASE_URL:
     raise RuntimeError("BOT_TOKEN, CHAT_ID, or DATABASE_URL missing")
-
-# If you want to allow running without CoinGecko Pro, change this to a warning.
-if not COINGECKO_API_KEY:
-    raise RuntimeError("COINGECKO_API_KEY missing (add it in Railway Variables)")
 
 # ======================
 # SETTINGS
@@ -81,14 +73,7 @@ TELEGRAM_SEND_RETRIES = 4
 # Requests session
 SESSION = requests.Session()
 SESSION.headers.update({
-    "User-Agent": "brads-trading-bot/2.2 (signals-only; whitelist; rate-safe)",
-    "accept": "application/json",
-})
-
-# Add CoinGecko Pro auth header
-# (CoinGecko Pro uses this header name exactly)
-SESSION.headers.update({
-    "x-cg-pro-api-key": COINGECKO_API_KEY
+    "User-Agent": "brads-trading-bot/2.2 (signals-only; whitelist; rate-safe)"
 })
 
 # ==============================
@@ -322,9 +307,12 @@ def build_levels_from_candles(entry, side, highs, lows, closes):
     """
     Conservative targets based on ATR and recent swing structure,
     but with HARD caps on take profits:
+
       TP1 max = +2%  (or -2% for short)
       TP2 max = +3.5%
       TP3 max = +5%
+
+    This keeps targets realistic and prevents huge ATR-driven jumps.
     """
     if entry is None or highs is None or lows is None or closes is None:
         return None
@@ -337,6 +325,7 @@ def build_levels_from_candles(entry, side, highs, lows, closes):
     recent_high = max(highs[-lookback:])
     recent_low = min(lows[-lookback:])
 
+    # HARD TP caps
     TP1_CAP = 0.02
     TP2_CAP = 0.035
     TP3_CAP = 0.05
@@ -609,7 +598,7 @@ def send_long_message(text):
         time.sleep(1.2)
 
 # ======================
-# COINGECKO SAFE HTTP (PRO)
+# COINGECKO SAFE HTTP
 # ======================
 def _get_json_with_backoff(url, params):
     delay = 5
@@ -618,10 +607,6 @@ def _get_json_with_backoff(url, params):
     for _ in range(COINGECKO_MAX_RETRIES):
         try:
             r = SESSION.get(url, params=params, timeout=COINGECKO_TIMEOUT)
-
-            if r.status_code == 401:
-                raise RuntimeError("CoinGecko 401 Unauthorized (check COINGECKO_API_KEY / plan access)")
-
             if r.status_code == 429:
                 retry_after = r.headers.get("Retry-After")
                 if retry_after:
@@ -632,15 +617,8 @@ def _get_json_with_backoff(url, params):
                 time.sleep(delay)
                 delay = min(delay * 2, 120)
                 continue
-
-            if 500 <= r.status_code < 600:
-                time.sleep(delay)
-                delay = min(delay * 2, 120)
-                continue
-
             r.raise_for_status()
             return r.json()
-
         except Exception as e:
             last_err = e
             time.sleep(delay)
@@ -665,7 +643,7 @@ def fetch_whitelist_markets():
     if _last_markets and (now - _last_markets_ts) < MARKETS_CACHE_TTL_SECONDS:
         return _last_markets
 
-    url = f"{COINGECKO_BASE_URL}/coins/markets"
+    url = "https://api.coingecko.com/api/v3/coins/markets"
 
     # CoinGecko supports ids=comma-separated. Keep chunks <= 200.
     all_rows = []
@@ -691,7 +669,7 @@ def fetch_simple_price_usd(coin_ids):
     if not coin_ids:
         return {}
     coin_ids = list(dict.fromkeys(coin_ids))[:200]
-    url = f"{COINGECKO_BASE_URL}/simple/price"
+    url = "https://api.coingecko.com/api/v3/simple/price"
     params = {"ids": ",".join(coin_ids), "vs_currencies": "usd"}
     data = _get_json_with_backoff(url, params)
     return {k: v.get("usd") for k, v in data.items()}
@@ -875,6 +853,7 @@ def scan_and_collect(conn):
     cooldown_cache = load_cooldowns(conn)
 
     for c in markets:
+        # extra safety: ensure it is in whitelist
         coin_id = c.get("id")
         if not coin_id or coin_id not in COINGECKO_COIN_IDS:
             continue
@@ -910,6 +889,7 @@ def scan_and_collect(conn):
         if key in pending_keys:
             continue
 
+        # base confidence + memory (do these BEFORE Binance to reduce API hits)
         conf = score(chg24, chg1h)
         blocked, mem_delta, mem_note = apply_memory_rules(conn, sym, side)
         if blocked:
@@ -922,6 +902,9 @@ def scan_and_collect(conn):
         if mem_note:
             notes.append(mem_note)
 
+        # ---------------------------
+        # Build realistic levels (Binance FIRST, but only for passing candidates)
+        # ---------------------------
         highs, lows, closes = fetch_binance_klines_usdt(sym, interval="1h", limit=120)
         levels = build_levels_from_candles(entry, side, highs, lows, closes)
 
@@ -929,12 +912,14 @@ def scan_and_collect(conn):
         if levels:
             atr_val = _atr(highs, lows, closes, period=14)
 
+        # CoinGecko fallback if Binance not available
         if not levels:
             high_24h = c.get("high_24h")
             low_24h = c.get("low_24h")
             if high_24h is None or low_24h is None or high_24h <= 0 or low_24h <= 0:
                 continue
 
+            # HARD caps (same as candle logic)
             TP1_CAP = 0.02
             TP2_CAP = 0.035
             TP3_CAP = 0.05
@@ -975,6 +960,9 @@ def scan_and_collect(conn):
 
         sl, tp1, tp2, tp3 = levels
 
+        # ----------------------
+        # AI Layer (fail-safe)
+        # ----------------------
         final_conf = conf_after_mem
         if ai_enabled():
             try:
@@ -1002,6 +990,7 @@ def scan_and_collect(conn):
 
                 final_conf = max(0, min(100, conf_after_mem + int(adj)))
 
+                # Only accept AI TP/SL if ATR available
                 if atr_val is not None:
                     sl, tp1, tp2, tp3 = validate_ai_levels(
                         side=side,
@@ -1019,8 +1008,10 @@ def scan_and_collect(conn):
         if final_conf < CONFIDENCE_MIN:
             continue
 
+        # persist cooldown
         set_cooldown(conn, sym, side, cooldown_cache)
 
+        # save + collect
         insert_trade(conn, ts_iso, sym, coin_id, coin_name, side, entry, sl, tp1, tp2, tp3, final_conf, chg1h, chg24)
 
         pending_keys.add(key)
