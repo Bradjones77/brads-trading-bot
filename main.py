@@ -44,7 +44,7 @@ if not COINGECKO_BASE_URL.startswith("http"):
 # ======================
 # SETTINGS
 # ======================
-SCAN_EVERY_SECONDS = 600          # scan every 10 minutes
+SCAN_EVERY_SECONDS = int(os.getenv("SCAN_EVERY_SECONDS", "600"))  # default scan every 10 minutes
 CONFIDENCE_MIN = 65
 MAX_SIGNALS_PER_HOUR = 10
 
@@ -74,7 +74,7 @@ MEM_LOOKBACK_DAYS = 14
 COINGECKO_TIMEOUT = 30
 COINGECKO_MAX_RETRIES = 6
 
-MARKETS_CACHE_TTL_SECONDS = 20 * 60
+MARKETS_CACHE_TTL_SECONDS = int(os.getenv("MARKETS_CACHE_TTL_SECONDS", str(20 * 60)))
 _last_markets = None
 _last_markets_ts = 0
 
@@ -85,10 +85,17 @@ _last_open_check_ts = 0
 TELEGRAM_MAX_CHARS = 3900  # keep under 4096 to be safe
 TELEGRAM_SEND_RETRIES = 4
 
+# ======================
+# TAKE PROFIT FALLBACK CAPS (ONLY used when bot can't decide)
+# ======================
+TP1_CAP_FALLBACK = 0.035     # 3.5%
+TP2_CAP_FALLBACK = 0.055     # 5.5%
+TP3_CAP_MAX_FALLBACK = 0.12  # 12% safety ceiling for dynamic TP3 fallback
+
 # Requests session
 SESSION = requests.Session()
 SESSION.headers.update({
-    "User-Agent": "brads-trading-bot/2.2 (signals-only; whitelist; rate-safe)",
+    "User-Agent": "brads-trading-bot/2.5 (AI-levels-safe; caps-fallback-only; whitelist; rate-safe)",
     "accept": "application/json",
     # ✅ CoinGecko Pro key is sent via header (NOT in URL)
     "x-cg-pro-api-key": COINGECKO_API_KEY
@@ -108,151 +115,49 @@ def coingecko_self_test():
 # ==============================
 COINGECKO_COIN_IDS = {
     # Majors / L1
-    "bitcoin",
-    "ethereum",
-    "binancecoin",
-    "ripple",
-    "solana",
-    "cardano",
-    "dogecoin",
-    "tron",
-    "bitcoin-cash",
-    "litecoin",
-    "polkadot",
-    "avalanche-2",
-    "cosmos",
-    "stellar",
-    "ethereum-classic",
-    "internet-computer",
-    "near",
-    "algorand",
-    "aptos",
-    "filecoin",
-    "vechain",
-    "hedera-hashgraph",
-    "zcash",
-    "monero",
+    "bitcoin", "ethereum", "binancecoin", "ripple", "solana", "cardano", "dogecoin",
+    "tron", "bitcoin-cash", "litecoin", "polkadot", "avalanche-2", "cosmos",
+    "stellar", "ethereum-classic", "internet-computer", "near", "algorand", "aptos",
+    "filecoin", "vechain", "hedera-hashgraph", "zcash", "monero",
 
     # DeFi / Core Infra
-    "chainlink",
-    "uniswap",
-    "aave",
-    "pancakeswap-token",
-    "curve-dao-token",
-    "synthetix-network-token",
-    "compound-governance-token",
-    "injective-protocol",
-    "lido-dao",
-    "morpho",
-    "dydx",
-    "the-graph",
-    "reserve-rights-token",
-    "qtum",
-    "kyber-network-crystal",
-    "loopring",
-    "bancor",
-    "0x",
-    "gnosis",
-    "band-protocol",
+    "chainlink", "uniswap", "aave", "pancakeswap-token", "curve-dao-token",
+    "synthetix-network-token", "compound-governance-token", "injective-protocol",
+    "lido-dao", "morpho", "dydx", "the-graph", "reserve-rights-token", "qtum",
+    "kyber-network-crystal", "loopring", "bancor", "0x", "gnosis", "band-protocol",
 
     # Layer 2 / Scaling / Modular
-    "arbitrum",
-    "optimism",
-    "stacks",
-    "starknet",
-    "layerzero",
-    "celestia",
-    "skale",
+    "arbitrum", "optimism", "stacks", "starknet", "layerzero", "celestia", "skale",
     "osmosis",
 
     # AI / Compute / Data
-    "bittensor",
-    "render-token",
-    "fetch-ai",
-    "io-net",
-    "numeraire",
+    "bittensor", "render-token", "fetch-ai", "io-net", "numeraire",
 
     # Memes
-    "shiba-inu",
-    "pepe",
-    "bonk",
-    "floki",
-    "dogwifcoin",
-    "cheems-token",
-    "book-of-meme",
-    "peanut-the-squirrel",
-    "official-trump",
+    "shiba-inu", "pepe", "bonk", "floki", "dogwifcoin", "cheems-token",
+    "book-of-meme", "peanut-the-squirrel", "official-trump",
 
     # Exchange / Wallet Tokens
-    "trust-wallet-token",
-    "nexo",
-    "kucoin-shares",
-    "okb",
-    "gatechain-token",
-    "htx",
-    "mx-token",
-    "bitget-token",
+    "trust-wallet-token", "nexo", "kucoin-shares", "okb", "gatechain-token", "htx",
+    "mx-token", "bitget-token",
 
     # Payments / Utility / Legacy
-    "xdc-network",
-    "iota",
-    "dash",
-    "horizen",
-    "siacoin",
-    "holo",
-    "ravencoin",
-    "verge",
-    "zilliqa",
-    "theta-fuel",
-    "theta-token",
-    "basic-attention-token",
+    "xdc-network", "iota", "dash", "horizen", "siacoin", "holo", "ravencoin",
+    "verge", "zilliqa", "theta-fuel", "theta-token", "basic-attention-token",
 
     # Gaming / NFT / Metaverse
-    "axie-infinity",
-    "apecoin",
-    "the-sandbox",
-    "gala",
-    "immutable-x",
-    "yield-guild-games",
-    "open-campus",
+    "axie-infinity", "apecoin", "the-sandbox", "gala", "immutable-x",
+    "yield-guild-games", "open-campus",
 
     # Stables (shared + liquid)
-    "tether",
-    "usd-coin",
-    "dai",
-    "true-usd",
-    "first-digital-usd",
-    "ethena-usde",
-    "ripple-usd",
-    "frax",
-    "paypal-usd",
+    "tether", "usd-coin", "dai", "true-usd", "first-digital-usd", "ethena-usde",
+    "ripple-usd", "frax", "paypal-usd",
 
     # Other Valid Overlaps
-    "jasmycoin",
-    "kite",
-    "walrus",
-    "sonic",
-    "safepal",
-    "space-id",
-    "magic-eden",
-    "power-ledger",
-    "audius",
-    "flux",
-    "ontology-gas",
-    "saga",
-    "origin-protocol",
-    "civic",
-    "everipedia",
-    "stratis",
-    "wax",
-    "cyberconnect",
-    "amp-token",
-    "oasis-network",
-    "livepeer",
-    "gas",
-    "wormhole",
-    "elrond-erd-2",
-    "eigenlayer"
+    "jasmycoin", "kite", "walrus", "sonic", "safepal", "space-id", "magic-eden",
+    "power-ledger", "audius", "flux", "ontology-gas", "saga", "origin-protocol",
+    "civic", "everipedia", "stratis", "wax", "cyberconnect", "amp-token",
+    "oasis-network", "livepeer", "gas", "wormhole", "elrond-erd-2", "eigenlayer"
 }
 
 # ======================
@@ -305,7 +210,7 @@ def fetch_binance_klines_usdt(symbol_upper: str, interval="1h", limit=120):
     return None, None, None
 
 # ======================
-# ATR + CONSERVATIVE LEVELS
+# ATR + BOT LEVELS (caps are fallback-only)
 # ======================
 def _atr(highs, lows, closes, period=14):
     try:
@@ -329,13 +234,10 @@ def _atr(highs, lows, closes, period=14):
     except Exception:
         return None
 
-def build_levels_from_candles(entry, side, highs, lows, closes):
+def build_levels_from_candles(entry, side, highs, lows, closes, use_caps: bool = False):
     """
-    Conservative targets based on ATR and recent swing structure,
-    but with HARD caps on take profits:
-      TP1 max = +2%  (or -2% for short)
-      TP2 max = +3.5%
-      TP3 max = +5%
+    ✅ Primary (use_caps=False): bot decides using ATR + structure (NO hard % caps).
+    ✅ Fallback (use_caps=True): apply % caps (TP1 3.5%, TP2 5.5%, TP3 dynamic capped).
     """
     if entry is None or highs is None or lows is None or closes is None:
         return None
@@ -348,28 +250,28 @@ def build_levels_from_candles(entry, side, highs, lows, closes):
     recent_high = max(highs[-lookback:])
     recent_low = min(lows[-lookback:])
 
-    TP1_CAP = 0.02
-    TP2_CAP = 0.035
-    TP3_CAP = 0.05
-
     if side == "LONG":
         sl = min(entry - 1.10 * atr, recent_low - 0.20 * atr)
 
-        tp1_atr = entry + 0.60 * atr
-        tp2_atr = entry + 1.00 * atr
-        tp3_atr = entry + 1.40 * atr
+        # bot ATR targets
+        tp1 = entry + 0.60 * atr
+        tp2 = entry + 1.00 * atr
+        tp3 = entry + 1.60 * atr  # a bit more upside; still validated by structure
 
-        tp1_cap = entry * (1.0 + TP1_CAP)
-        tp2_cap = entry * (1.0 + TP2_CAP)
-        tp3_cap = entry * (1.0 + TP3_CAP)
-
-        tp1 = min(tp1_atr, tp1_cap)
-        tp2 = min(tp2_atr, tp2_cap)
-        tp3 = min(tp3_atr, tp3_cap)
-
+        # structure sanity (always)
         tp1 = min(tp1, recent_high * 0.995)
         tp2 = min(tp2, recent_high * 1.000)
-        tp3 = min(tp3, recent_high * 1.005)
+        tp3 = min(tp3, recent_high * 1.010)
+
+        # caps ONLY if fallback mode
+        if use_caps:
+            tp1 = min(tp1, entry * (1.0 + TP1_CAP_FALLBACK))
+            tp2 = min(tp2, entry * (1.0 + TP2_CAP_FALLBACK))
+
+            # dynamic TP3 (bot decides) but capped for safety
+            # choose cap from volatility: ~1.8*ATR as pct, but never above TP3_CAP_MAX_FALLBACK
+            tp3_pct = min(TP3_CAP_MAX_FALLBACK, max(TP2_CAP_FALLBACK + 0.01, (1.8 * atr) / max(1e-12, entry)))
+            tp3 = min(tp3, entry * (1.0 + tp3_pct))
 
         if not (sl < entry < tp1 < tp2 < tp3):
             return None
@@ -378,27 +280,30 @@ def build_levels_from_candles(entry, side, highs, lows, closes):
     else:  # SHORT
         sl = max(entry + 1.10 * atr, recent_high + 0.20 * atr)
 
-        tp1_atr = entry - 0.55 * atr
-        tp2_atr = entry - 0.90 * atr
-        tp3_atr = entry - 1.25 * atr
-
-        tp1_cap = entry * (1.0 - TP1_CAP)
-        tp2_cap = entry * (1.0 - TP2_CAP)
-        tp3_cap = entry * (1.0 - TP3_CAP)
-
-        tp1 = max(tp1_atr, tp1_cap)
-        tp2 = max(tp2_atr, tp2_cap)
-        tp3 = max(tp3_atr, tp3_cap)
+        tp1 = entry - 0.55 * atr
+        tp2 = entry - 0.90 * atr
+        tp3 = entry - 1.45 * atr
 
         tp1 = max(tp1, recent_low * 1.005)
         tp2 = max(tp2, recent_low * 1.000)
-        tp3 = max(tp3, recent_low * 0.995)
+        tp3 = max(tp3, recent_low * 0.990)
+
+        if use_caps:
+            tp1 = max(tp1, entry * (1.0 - TP1_CAP_FALLBACK))
+            tp2 = max(tp2, entry * (1.0 - TP2_CAP_FALLBACK))
+
+            tp3_pct = min(TP3_CAP_MAX_FALLBACK, max(TP2_CAP_FALLBACK + 0.01, (1.8 * atr) / max(1e-12, entry)))
+            tp3 = max(tp3, entry * (1.0 - tp3_pct))
 
         if not (tp3 < tp2 < tp1 < entry < sl):
             return None
         return sl, tp1, tp2, tp3
 
 def validate_ai_levels(side, entry, atr_value, fallback_levels, ai_levels):
+    """
+    AI can suggest SL/TPs ONLY.
+    Bot applies AI ONLY if valid under ATR safety rails; otherwise uses fallback.
+    """
     if not ai_levels:
         return fallback_levels
 
@@ -418,21 +323,69 @@ def validate_ai_levels(side, entry, atr_value, fallback_levels, ai_levels):
             return fallback_levels
         if (tp1 - entry) > 1.2 * atr_value:
             return fallback_levels
-        if (tp3 - entry) > 2.5 * atr_value:
+        if (tp3 - entry) > 2.8 * atr_value:
             return fallback_levels
-        if (entry - sl) > 1.3 * atr_value:
+        if (entry - sl) > 1.35 * atr_value:
             return fallback_levels
     else:
         if not (tp3 < tp2 < tp1 < entry < sl):
             return fallback_levels
         if (entry - tp1) > 1.2 * atr_value:
             return fallback_levels
-        if (entry - tp3) > 2.5 * atr_value:
+        if (entry - tp3) > 2.8 * atr_value:
             return fallback_levels
-        if (sl - entry) > 1.3 * atr_value:
+        if (sl - entry) > 1.35 * atr_value:
             return fallback_levels
 
     return (sl, tp1, tp2, tp3)
+
+def _rr_to_tp1(side, entry, sl, tp1):
+    try:
+        if side == "LONG":
+            risk = max(1e-12, entry - sl)
+            reward = max(1e-12, tp1 - entry)
+        else:
+            risk = max(1e-12, sl - entry)
+            reward = max(1e-12, entry - tp1)
+        return reward / risk
+    except Exception:
+        return None
+
+def ai_levels_better(side, entry, fallback_levels, candidate_levels):
+    """
+    Apply AI levels only if they look 'better' (simple rule):
+    - RR to TP1 is not worse, OR TP3 improves without worsening risk
+    """
+    try:
+        f_sl, f_tp1, f_tp2, f_tp3 = fallback_levels
+        a_sl, a_tp1, a_tp2, a_tp3 = candidate_levels
+    except Exception:
+        return False
+
+    f_rr = _rr_to_tp1(side, entry, f_sl, f_tp1)
+    a_rr = _rr_to_tp1(side, entry, a_sl, a_tp1)
+
+    # If RR can't be computed, be conservative: don't switch.
+    if f_rr is None or a_rr is None:
+        return False
+
+    # Require AI RR to be at least as good (tiny tolerance)
+    if a_rr + 1e-9 < f_rr:
+        return False
+
+    # Also avoid AI making risk massively bigger
+    if side == "LONG":
+        f_risk = entry - f_sl
+        a_risk = entry - a_sl
+    else:
+        f_risk = f_sl - entry
+        a_risk = a_sl - entry
+
+    if a_risk > f_risk * 1.15:
+        return False
+
+    # Prefer if TP3 is improved (optional), but not required if RR ok
+    return True
 
 # ======================
 # DATABASE
@@ -620,34 +573,48 @@ def send_long_message(text):
         time.sleep(1.2)
 
 # ======================
-# COINGECKO SAFE HTTP
+# COINGECKO SAFE HTTP (fixed: never ends with None)
 # ======================
 def _get_json_with_backoff(url, params):
     delay = 5
-    last_err = None
+    last_err = "unknown"
 
-    for _ in range(COINGECKO_MAX_RETRIES):
+    for attempt in range(1, COINGECKO_MAX_RETRIES + 1):
         try:
             r = SESSION.get(url, params=params, timeout=COINGECKO_TIMEOUT)
 
             if r.status_code == 401:
-                raise RuntimeError("CoinGecko 401 Unauthorized (check COINGECKO_API_KEY / plan / base URL)")
+                last_err = "HTTP 401 Unauthorized (check COINGECKO_API_KEY / plan / base URL)"
+                raise RuntimeError(last_err)
 
             if r.status_code == 429:
                 retry_after = r.headers.get("Retry-After")
+                ra = None
                 if retry_after:
                     try:
-                        delay = max(delay, int(retry_after))
+                        ra = int(retry_after)
                     except Exception:
-                        pass
-                time.sleep(delay)
+                        ra = None
+
+                # ✅ ALWAYS set last_err on 429 so it can never be None
+                body_snip = (r.text[:200] if getattr(r, "text", None) else "")
+                last_err = f"HTTP 429 rate limited retry_after={ra} body={body_snip}"
+
+                sleep_for = max(delay, ra or 0)
+                sleep_for = min(sleep_for, 120)
+                time.sleep(sleep_for)
                 delay = min(delay * 2, 120)
                 continue
 
-            r.raise_for_status()
+            if r.status_code >= 400:
+                body_snip = (r.text[:200] if getattr(r, "text", None) else "")
+                last_err = f"HTTP {r.status_code} body={body_snip}"
+                r.raise_for_status()
+
             return r.json()
+
         except Exception as e:
-            last_err = e
+            last_err = repr(e)
             time.sleep(delay)
             delay = min(delay * 2, 120)
 
@@ -752,21 +719,14 @@ def apply_memory_rules(conn, symbol, side):
 # ======================
 def build_ai_context(coin_name, sym, side, entry, sl, tp1, tp2, tp3, base_conf, chg1h, chg24, atr_value, mem_total=None, mem_winrate=None):
     action = "BUY" if side == "LONG" else "SELL"
-    rr_tp1 = None
-    try:
-        if side == "LONG":
-            rr_tp1 = (tp1 - entry) / max(1e-12, (entry - sl))
-        else:
-            rr_tp1 = (entry - tp1) / max(1e-12, (sl - entry))
-    except Exception:
-        rr_tp1 = None
+    rr_tp1 = _rr_to_tp1(side, entry, sl, tp1)
 
     return {
         "coin": coin_name,
         "symbol": sym,
         "direction": side,
         "action": action,
-        "entry": entry,
+        "entry": entry,  # ✅ bot-controlled entry (AI must not change)
         "stop_loss": sl,
         "tp1": tp1,
         "tp2": tp2,
@@ -780,7 +740,8 @@ def build_ai_context(coin_name, sym, side, entry, sl, tp1, tp2, tp3, base_conf, 
             "lookback_days": MEM_LOOKBACK_DAYS,
             "closed_trades": mem_total,
             "win_rate": mem_winrate
-        }
+        },
+        "rule": "AI may suggest SL/TP only. Bot validates & may apply if better. Entry must remain bot-controlled."
     }
 
 # ======================
@@ -898,6 +859,7 @@ def scan_and_collect(conn):
         if not sym:
             continue
 
+        # cooldown (DB; RAM fallback)
         try:
             if not cooldown_ok(sym, side, cooldown_cache):
                 continue
@@ -922,35 +884,40 @@ def scan_and_collect(conn):
         if mem_note:
             notes.append(mem_note)
 
+        # --------------------------
+        # Levels: BOT FIRST (no caps)
+        # --------------------------
         highs, lows, closes = fetch_binance_klines_usdt(sym, interval="1h", limit=120)
-        levels = build_levels_from_candles(entry, side, highs, lows, closes)
 
-        atr_val = None
-        if levels:
-            atr_val = _atr(highs, lows, closes, period=14)
+        levels = build_levels_from_candles(entry, side, highs, lows, closes, use_caps=False)
+        atr_val = _atr(highs, lows, closes, period=14) if levels else None
 
+        # If bot couldn't decide, fallback to capped mode (still using Binance data)
+        if not levels:
+            levels = build_levels_from_candles(entry, side, highs, lows, closes, use_caps=True)
+            if levels and atr_val is None:
+                atr_val = _atr(highs, lows, closes, period=14)
+
+        # If still no levels, fallback to CoinGecko 24h high/low WITH CAPS (fallback-only)
+        used_caps_fallback = False
         if not levels:
             high_24h = c.get("high_24h")
             low_24h = c.get("low_24h")
             if high_24h is None or low_24h is None or high_24h <= 0 or low_24h <= 0:
                 continue
 
-            TP1_CAP = 0.02
-            TP2_CAP = 0.035
-            TP3_CAP = 0.05
+            used_caps_fallback = True
 
             if side == "LONG":
                 sl = low_24h * 0.997
                 if sl >= entry:
                     continue
 
-                tp1 = entry * (1.0 + TP1_CAP)
-                tp2 = entry * (1.0 + TP2_CAP)
-                tp3 = entry * (1.0 + TP3_CAP)
+                tp1 = min(entry * (1.0 + TP1_CAP_FALLBACK), high_24h * 0.995)
+                tp2 = min(entry * (1.0 + TP2_CAP_FALLBACK), high_24h * 1.000)
 
-                tp1 = min(tp1, high_24h * 0.995)
-                tp2 = min(tp2, high_24h * 1.000)
-                tp3 = min(tp3, high_24h * 1.005)
+                tp3_cap_dynamic = entry * (1.0 + TP3_CAP_MAX_FALLBACK)
+                tp3 = min(tp3_cap_dynamic, high_24h * 1.005)
 
                 if not (sl < entry < tp1 < tp2 < tp3):
                     continue
@@ -959,13 +926,11 @@ def scan_and_collect(conn):
                 if sl <= entry:
                     continue
 
-                tp1 = entry * (1.0 - TP1_CAP)
-                tp2 = entry * (1.0 - TP2_CAP)
-                tp3 = entry * (1.0 - TP3_CAP)
+                tp1 = max(entry * (1.0 - TP1_CAP_FALLBACK), low_24h * 1.005)
+                tp2 = max(entry * (1.0 - TP2_CAP_FALLBACK), low_24h * 1.000)
 
-                tp1 = max(tp1, low_24h * 1.005)
-                tp2 = max(tp2, low_24h * 1.000)
-                tp3 = max(tp3, low_24h * 0.995)
+                tp3_cap_dynamic = entry * (1.0 - TP3_CAP_MAX_FALLBACK)
+                tp3 = max(tp3_cap_dynamic, low_24h * 0.995)
 
                 if not (tp3 < tp2 < tp1 < entry < sl):
                     continue
@@ -974,7 +939,16 @@ def scan_and_collect(conn):
 
         sl, tp1, tp2, tp3 = levels
 
+        # --------------------------
+        # AI: may suggest SL/TP only
+        # Bot applies ONLY if valid + better; otherwise keeps bot levels.
+        # --------------------------
         final_conf = conf_after_mem
+        ai_applied = False
+
+        if used_caps_fallback:
+            notes.append("Fallback caps used (bot couldn't decide levels)")
+
         if ai_enabled():
             try:
                 mem_total, mem_wr = get_recent_side_performance(conn, sym, side)
@@ -982,7 +956,7 @@ def scan_and_collect(conn):
                     coin_name=coin_name,
                     sym=sym,
                     side=side,
-                    entry=entry,
+                    entry=entry,   # ✅ entry stays bot-controlled
                     sl=sl,
                     tp1=tp1,
                     tp2=tp2,
@@ -1001,8 +975,9 @@ def scan_and_collect(conn):
 
                 final_conf = max(0, min(100, conf_after_mem + int(adj)))
 
-                if atr_val is not None:
-                    sl, tp1, tp2, tp3 = validate_ai_levels(
+                # Validate + compare
+                if atr_val is not None and ai_levels:
+                    candidate = validate_ai_levels(
                         side=side,
                         entry=entry,
                         atr_value=atr_val,
@@ -1010,8 +985,19 @@ def scan_and_collect(conn):
                         ai_levels=ai_levels
                     )
 
+                    if candidate != (sl, tp1, tp2, tp3) and ai_levels_better(side, entry, (sl, tp1, tp2, tp3), candidate):
+                        sl, tp1, tp2, tp3 = candidate
+                        ai_applied = True
+
                 if reason:
                     notes.append(f"AI: {reason} ({int(adj):+d})")
+                if ai_applied:
+                    notes.append("✅ AI levels applied")
+                else:
+                    # only add this if you want it visible every time AI doesn't change levels
+                    # notes.append("AI suggestion not applied (kept bot levels)")
+                    pass
+
             except Exception:
                 final_conf = conf_after_mem
 
@@ -1024,7 +1010,10 @@ def scan_and_collect(conn):
 
         pending_keys.add(key)
         pending_signals.append(
-            format_signal_msg(coin_name, sym, side, entry, sl, tp1, tp2, tp3, final_conf, chg1h, chg24, now_str, notes=notes)
+            format_signal_msg(
+                coin_name, sym, side, entry, sl, tp1, tp2, tp3,
+                final_conf, chg1h, chg24, now_str, notes=notes
+            )
         )
 
         if len(pending_signals) >= MAX_SIGNALS_PER_HOUR:
@@ -1070,11 +1059,13 @@ def main():
     send_message(
         "✅ Bot online. Analysing 24/7.\n"
         "⏳ Signals are sent once per hour.\n"
+        f"⏱ Scan interval: {SCAN_EVERY_SECONDS}s\n"
         f"🤖 AI Filter: {ai_status}\n"
         f"🧾 CoinGecko Whitelist: {len(COINGECKO_COIN_IDS)} coins ✅\n"
         "🧠 Decision Memory: ON ✅\n"
         "🕒 Persistent Cooldowns: ON ✅\n"
         "📩 Telegram Chunking: ON ✅\n"
+        "🛟 TP caps are FALLBACK-ONLY (used only if bot can't decide)\n"
         "_Not financial advice_"
     )
 
