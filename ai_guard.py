@@ -7,7 +7,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_TIMEOUT = float(os.getenv("OPENAI_TIMEOUT", "8"))
 
-# ✅ NEW: by default AI is NOT allowed to override SL/TP unless main.py explicitly asks for it
+# ✅ By default AI is NOT allowed to override SL/TP unless main.py explicitly asks for it
 AI_LEVELS_ONLY_WHEN_REQUESTED = (os.getenv("AI_LEVELS_ONLY_WHEN_REQUESTED", "1").strip() == "1")
 
 
