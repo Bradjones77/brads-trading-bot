@@ -103,7 +103,7 @@ def coingecko_self_test():
     r.raise_for_status()
     print("✅ CoinGecko OK:", r.json())
 
-})
+}
 
 # ==============================
 # COINGECKO WHITELIST (YOUR LIST)
