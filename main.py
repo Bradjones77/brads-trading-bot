@@ -103,8 +103,6 @@ def coingecko_self_test():
     r.raise_for_status()
     print("✅ CoinGecko OK:", r.json())
 
-}
-
 # ==============================
 # COINGECKO WHITELIST (YOUR LIST)
 # ==============================
@@ -289,7 +287,6 @@ def fetch_binance_klines_usdt(symbol_upper: str, interval="1h", limit=120):
                 delay = min(delay * 2, 20)
                 continue
             if r.status_code == 400:
-                # Pair doesn't exist on Binance
                 return None, None, None
             r.raise_for_status()
             rows = r.json()
@@ -351,7 +348,6 @@ def build_levels_from_candles(entry, side, highs, lows, closes):
     recent_high = max(highs[-lookback:])
     recent_low = min(lows[-lookback:])
 
-    # HARD TP caps
     TP1_CAP = 0.02
     TP2_CAP = 0.035
     TP3_CAP = 0.05
@@ -634,7 +630,6 @@ def _get_json_with_backoff(url, params):
         try:
             r = SESSION.get(url, params=params, timeout=COINGECKO_TIMEOUT)
 
-            # Helpful errors when using Pro
             if r.status_code == 401:
                 raise RuntimeError("CoinGecko 401 Unauthorized (check COINGECKO_API_KEY / plan / base URL)")
 
@@ -664,21 +659,14 @@ def _chunk_list(items, chunk_size):
         yield items[i:i + chunk_size]
 
 def fetch_whitelist_markets():
-    """
-    Fetch ONLY the coins in COINGECKO_COIN_IDS.
-    Uses CoinGecko /coins/markets with ids=... (chunked for safety).
-    Cached to reduce API calls.
-    """
     global _last_markets, _last_markets_ts
 
     now = time.time()
     if _last_markets and (now - _last_markets_ts) < MARKETS_CACHE_TTL_SECONDS:
         return _last_markets
 
-    # ✅ Pro base URL
     url = f"{COINGECKO_BASE_URL}/coins/markets"
 
-    # CoinGecko supports ids=comma-separated. Keep chunks <= 200.
     all_rows = []
     for chunk in _chunk_list(sorted(COINGECKO_COIN_IDS), 200):
         params = {
@@ -703,9 +691,7 @@ def fetch_simple_price_usd(coin_ids):
         return {}
     coin_ids = list(dict.fromkeys(coin_ids))[:200]
 
-    # ✅ Pro base URL
     url = f"{COINGECKO_BASE_URL}/simple/price"
-
     params = {"ids": ",".join(coin_ids), "vs_currencies": "usd"}
     data = _get_json_with_backoff(url, params)
     return {k: v.get("usd") for k, v in data.items()}
@@ -889,7 +875,6 @@ def scan_and_collect(conn):
     cooldown_cache = load_cooldowns(conn)
 
     for c in markets:
-        # extra safety: ensure it is in whitelist
         coin_id = c.get("id")
         if not coin_id or coin_id not in COINGECKO_COIN_IDS:
             continue
@@ -913,7 +898,6 @@ def scan_and_collect(conn):
         if not sym:
             continue
 
-        # cooldown
         try:
             if not cooldown_ok(sym, side, cooldown_cache):
                 continue
@@ -925,11 +909,11 @@ def scan_and_collect(conn):
         if key in pending_keys:
             continue
 
-        # base confidence + memory (do these BEFORE Binance to reduce API hits)
         conf = score(chg24, chg1h)
         blocked, mem_delta, mem_note = apply_memory_rules(conn, sym, side)
         if blocked:
             continue
+
         conf_after_mem = max(0, min(100, conf + mem_delta))
         if conf_after_mem < CONFIDENCE_MIN:
             continue
@@ -970,7 +954,6 @@ def scan_and_collect(conn):
 
                 if not (sl < entry < tp1 < tp2 < tp3):
                     continue
-
             else:
                 sl = high_24h * 1.003
                 if sl <= entry:
@@ -1075,6 +1058,12 @@ def send_hourly_update(conn):
 # ======================
 def main():
     conn = db_connect()
+
+    # ✅ Run a quick test at startup (shows in Railway logs)
+    try:
+        coingecko_self_test()
+    except Exception as e:
+        print("coingecko_self_test error:", e)
 
     ai_status = "ON ✅" if ai_enabled() else "OFF (no OPENAI_API_KEY) ⚠️"
     send_message(
