@@ -19,24 +19,27 @@ except Exception:
 # ======================
 # ENVIRONMENT VARIABLES
 # ======================
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
-DATABASE_URL = os.getenv("DATABASE_URL")
+BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
+CHAT_ID = (os.getenv("CHAT_ID") or "").strip()
+DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip()
 
 # ✅ CoinGecko Pro (Basic/Analyst both use the same auth header)
-COINGECKO_API_KEY = os.getenv("COINGECKO_API_KEY")
+COINGECKO_API_KEY = (os.getenv("COINGECKO_API_KEY") or "").strip()
 
 # ✅ FIX: strip() removes hidden spaces/newlines (prevents %0A in URLs)
-COINGECKO_BASE_URL = os.getenv(
+COINGECKO_BASE_URL = (os.getenv(
     "COINGECKO_BASE_URL",
     "https://pro-api.coingecko.com/api/v3"
-).strip().rstrip("/")
+) or "").strip().rstrip("/")
 
 if not BOT_TOKEN or not CHAT_ID or not DATABASE_URL:
     raise RuntimeError("BOT_TOKEN, CHAT_ID, or DATABASE_URL missing")
 
 if not COINGECKO_API_KEY:
     raise RuntimeError("COINGECKO_API_KEY missing (set Railway Variable COINGECKO_API_KEY)")
+
+if not COINGECKO_BASE_URL.startswith("http"):
+    raise RuntimeError(f"COINGECKO_BASE_URL looks wrong: {COINGECKO_BASE_URL!r}")
 
 # ======================
 # SETTINGS
@@ -89,6 +92,17 @@ SESSION.headers.update({
     "accept": "application/json",
     # ✅ CoinGecko Pro key is sent via header (NOT in URL)
     "x-cg-pro-api-key": COINGECKO_API_KEY
+})
+
+def coingecko_self_test():
+    """
+    Startup test so you KNOW the CoinGecko API is working.
+    """
+    url = f"{COINGECKO_BASE_URL}/ping"
+    r = SESSION.get(url, timeout=15)
+    r.raise_for_status()
+    print("✅ CoinGecko OK:", r.json())
+
 })
 
 # ==============================
