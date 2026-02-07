@@ -25,7 +25,12 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 
 # ✅ CoinGecko Pro (Basic/Analyst both use the same auth header)
 COINGECKO_API_KEY = os.getenv("COINGECKO_API_KEY")
-COINGECKO_BASE_URL = os.getenv("COINGECKO_BASE_URL", "https://pro-api.coingecko.com/api/v3").rstrip("/")
+
+# ✅ FIX: strip() removes hidden spaces/newlines (prevents %0A in URLs)
+COINGECKO_BASE_URL = os.getenv(
+    "COINGECKO_BASE_URL",
+    "https://pro-api.coingecko.com/api/v3"
+).strip().rstrip("/")
 
 if not BOT_TOKEN or not CHAT_ID or not DATABASE_URL:
     raise RuntimeError("BOT_TOKEN, CHAT_ID, or DATABASE_URL missing")
@@ -919,9 +924,6 @@ def scan_and_collect(conn):
         if mem_note:
             notes.append(mem_note)
 
-        # ---------------------------
-        # Build realistic levels (Binance FIRST, but only for passing candidates)
-        # ---------------------------
         highs, lows, closes = fetch_binance_klines_usdt(sym, interval="1h", limit=120)
         levels = build_levels_from_candles(entry, side, highs, lows, closes)
 
@@ -929,14 +931,12 @@ def scan_and_collect(conn):
         if levels:
             atr_val = _atr(highs, lows, closes, period=14)
 
-        # CoinGecko fallback if Binance not available
         if not levels:
             high_24h = c.get("high_24h")
             low_24h = c.get("low_24h")
             if high_24h is None or low_24h is None or high_24h <= 0 or low_24h <= 0:
                 continue
 
-            # HARD caps (same as candle logic)
             TP1_CAP = 0.02
             TP2_CAP = 0.035
             TP3_CAP = 0.05
@@ -977,9 +977,6 @@ def scan_and_collect(conn):
 
         sl, tp1, tp2, tp3 = levels
 
-        # ----------------------
-        # AI Layer (fail-safe)
-        # ----------------------
         final_conf = conf_after_mem
         if ai_enabled():
             try:
@@ -1007,7 +1004,6 @@ def scan_and_collect(conn):
 
                 final_conf = max(0, min(100, conf_after_mem + int(adj)))
 
-                # Only accept AI TP/SL if ATR available
                 if atr_val is not None:
                     sl, tp1, tp2, tp3 = validate_ai_levels(
                         side=side,
@@ -1025,10 +1021,7 @@ def scan_and_collect(conn):
         if final_conf < CONFIDENCE_MIN:
             continue
 
-        # persist cooldown
         set_cooldown(conn, sym, side, cooldown_cache)
-
-        # save + collect
         insert_trade(conn, ts_iso, sym, coin_id, coin_name, side, entry, sl, tp1, tp2, tp3, final_conf, chg1h, chg24)
 
         pending_keys.add(key)
