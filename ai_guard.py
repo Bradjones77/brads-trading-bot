@@ -7,8 +7,13 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_TIMEOUT = float(os.getenv("OPENAI_TIMEOUT", "8"))
 
+# ✅ NEW: by default AI is NOT allowed to override SL/TP unless main.py explicitly asks for it
+AI_LEVELS_ONLY_WHEN_REQUESTED = (os.getenv("AI_LEVELS_ONLY_WHEN_REQUESTED", "1").strip() == "1")
+
+
 def ai_enabled() -> bool:
     return bool(OPENAI_API_KEY)
+
 
 def _openai_chat(prompt: str) -> str:
     """
@@ -23,7 +28,7 @@ def _openai_chat(prompt: str) -> str:
     payload = {
         "model": OPENAI_MODEL,
         "temperature": 0.1,
-        "max_tokens": 220,  # keep tight
+        "max_tokens": 260,  # small bump to reduce truncation risk
         "response_format": {"type": "json_object"},
         "messages": [
             {
@@ -41,15 +46,19 @@ def _openai_chat(prompt: str) -> str:
     data = r.json()
     return data["choices"][0]["message"]["content"]
 
+
 def judge_trade(trade: Dict[str, Any]) -> Tuple[bool, int, str, Dict[str, float]]:
     """
     Returns: (approved, confidence_adjust, reason, levels)
 
-    levels may include stop_loss,tp1,tp2,tp3 (all required if provided).
+    levels may be {} OR must include stop_loss,tp1,tp2,tp3 (all required if provided).
     Caller still validates levels (ordering + ATR clamps).
     """
     if not ai_enabled():
         raise RuntimeError("AI disabled: OPENAI_API_KEY not set")
+
+    # ✅ Bot controls whether AI is allowed to suggest levels this time
+    request_ai_levels = bool(trade.get("request_ai_levels", False))
 
     # Pull ATR if present (your main.py includes atr_1h in ctx)
     atr = trade.get("atr_1h", None)
@@ -59,8 +68,6 @@ def judge_trade(trade: Dict[str, Any]) -> Tuple[bool, int, str, Dict[str, float]
         atr = None
 
     # Hard conservative guidance (AI must follow)
-    # If ATR exists: TPs must be small-to-moderate ATR multiples.
-    # If ATR missing: AI should normally NOT override levels.
     guardrails = {
         "if_atr_present": {
             "long": {
@@ -82,9 +89,26 @@ def judge_trade(trade: Dict[str, Any]) -> Tuple[bool, int, str, Dict[str, float]
         }
     }
 
-    # Keep prompt compact to reduce failures/cost
+    rules = [
+        "Return ONLY a JSON object with keys: approved, confidence_adjust, reason, levels.",
+        "confidence_adjust must be an integer between -20 and +20.",
+        "reason must be a short string <= 120 chars.",
+        "levels must be {} OR must include ALL FOUR keys: stop_loss,tp1,tp2,tp3.",
+        "Be conservative. Prefer NOT to override levels unless you are confident.",
+        "Do NOT invent data. Use only fields provided in trade.",
+        "NEVER change entry. Entry is bot-controlled and immutable."
+    ]
+
+    # ✅ Enforce: AI can only propose levels when explicitly requested
+    if AI_LEVELS_ONLY_WHEN_REQUESTED:
+        rules.append("If request_ai_levels is false, set levels to {}.")
+
+    # ✅ Extra safety: if ATR missing, no level overrides
+    if atr is None:
+        rules.append("If atr_1h is missing or invalid, set levels to {}.")
+
     prompt_obj = {
-        "task": "Approve/reject the trade. Optionally suggest conservative TP/SL.",
+        "task": "Approve/reject the trade. Optionally suggest conservative TP/SL if allowed.",
         "output_schema": {
             "approved": "boolean",
             "confidence_adjust": "integer -20..+20",
@@ -96,13 +120,7 @@ def judge_trade(trade: Dict[str, Any]) -> Tuple[bool, int, str, Dict[str, float]
                 "tp3": "number"
             }
         },
-        "rules": [
-            "Return ONLY a JSON object with keys: approved, confidence_adjust, reason, levels.",
-            "confidence_adjust must be an integer between -20 and +20.",
-            "levels must be {} OR must include ALL FOUR keys: stop_loss,tp1,tp2,tp3.",
-            "Be conservative. Prefer NOT to override levels unless you are confident.",
-            "Do NOT invent data. Use only fields provided in trade."
-        ],
+        "rules": rules,
         "guardrails": guardrails,
         "trade": trade
     }
@@ -142,9 +160,12 @@ def judge_trade(trade: Dict[str, Any]) -> Tuple[bool, int, str, Dict[str, float]
     if not all(k in levels for k in ("stop_loss", "tp1", "tp2", "tp3")):
         levels = {}
 
-    # If ATR missing, strongly discourage overrides (extra safety)
+    # ✅ Enforce: if bot didn't request levels, ignore levels
+    if AI_LEVELS_ONLY_WHEN_REQUESTED and not request_ai_levels:
+        levels = {}
+
+    # ✅ If ATR missing, never allow overrides
     if atr is None and levels:
-        # if ATR isn't available, don't let AI override targets
         levels = {}
 
     return approved, adj, reason, levels
