@@ -92,10 +92,18 @@ TP1_CAP_FALLBACK = 0.035     # 3.5%
 TP2_CAP_FALLBACK = 0.055     # 5.5%
 TP3_CAP_MAX_FALLBACK = 0.12  # 12% safety ceiling for dynamic TP3 fallback
 
+# ======================
+# COINGECKO OHLC SETTINGS (candles source)
+# ======================
+# CoinGecko OHLC endpoint supports days: 1, 7, 14, 30, 90, 180, 365, max
+COINGECKO_OHLC_DAYS = int(os.getenv("COINGECKO_OHLC_DAYS", "7"))
+COINGECKO_OHLC_CACHE_TTL_SECONDS = int(os.getenv("COINGECKO_OHLC_CACHE_TTL_SECONDS", str(10 * 60)))
+_ohlc_cache = {}  # coin_id -> (ts, highs, lows, closes)
+
 # Requests session
 SESSION = requests.Session()
 SESSION.headers.update({
-    "User-Agent": "brads-trading-bot/2.5 (AI-levels-safe; caps-fallback-only; whitelist; rate-safe)",
+    "User-Agent": "brads-trading-bot/2.6 (coingecko-ohlc; AI-levels-safe; caps-fallback-only; whitelist; rate-safe)",
     "accept": "application/json",
     # ✅ CoinGecko Pro key is sent via header (NOT in URL)
     "x-cg-pro-api-key": COINGECKO_API_KEY
@@ -161,53 +169,140 @@ COINGECKO_COIN_IDS = {
 }
 
 # ======================
-# BINANCE CANDLE DATA (throttled)
+# COINGECKO SAFE HTTP (fixed: never ends with None)
 # ======================
-BINANCE_TIMEOUT = 10
-BINANCE_MAX_RETRIES = 3
-BINANCE_KLINES_CACHE_TTL_SECONDS = 60 * 60  # cache 1h per symbol
-_binance_cache = {}  # key -> (ts, highs, lows, closes)
+def _get_json_with_backoff(url, params):
+    delay = 5
+    last_err = "unknown"
 
-def fetch_binance_klines_usdt(symbol_upper: str, interval="1h", limit=120):
-    """
-    Returns highs, lows, closes arrays from Binance klines using SYMBOLUSDT.
-    Throttled with cache. Fail-safe returns (None, None, None).
-    """
+    for attempt in range(1, COINGECKO_MAX_RETRIES + 1):
+        try:
+            r = SESSION.get(url, params=params, timeout=COINGECKO_TIMEOUT)
+
+            if r.status_code == 401:
+                last_err = "HTTP 401 Unauthorized (check COINGECKO_API_KEY / plan / base URL)"
+                raise RuntimeError(last_err)
+
+            if r.status_code == 429:
+                retry_after = r.headers.get("Retry-After")
+                ra = None
+                if retry_after:
+                    try:
+                        ra = int(retry_after)
+                    except Exception:
+                        ra = None
+
+                body_snip = (r.text[:200] if getattr(r, "text", None) else "")
+                last_err = f"HTTP 429 rate limited retry_after={ra} body={body_snip}"
+
+                sleep_for = max(delay, ra or 0)
+                sleep_for = min(sleep_for, 120)
+                time.sleep(sleep_for)
+                delay = min(delay * 2, 120)
+                continue
+
+            if r.status_code >= 400:
+                body_snip = (r.text[:200] if getattr(r, "text", None) else "")
+                last_err = f"HTTP {r.status_code} body={body_snip}"
+                r.raise_for_status()
+
+            return r.json()
+
+        except Exception as e:
+            last_err = repr(e)
+            time.sleep(delay)
+            delay = min(delay * 2, 120)
+
+    raise RuntimeError(f"CoinGecko request failed after retries: {last_err}")
+
+def _chunk_list(items, chunk_size):
+    items = list(items)
+    for i in range(0, len(items), chunk_size):
+        yield items[i:i + chunk_size]
+
+def fetch_whitelist_markets():
+    global _last_markets, _last_markets_ts
+
     now = time.time()
-    cache_key = (symbol_upper, interval, limit)
-    cached = _binance_cache.get(cache_key)
-    if cached and (now - cached[0]) < BINANCE_KLINES_CACHE_TTL_SECONDS:
+    if _last_markets and (now - _last_markets_ts) < MARKETS_CACHE_TTL_SECONDS:
+        return _last_markets
+
+    url = f"{COINGECKO_BASE_URL}/coins/markets"
+
+    all_rows = []
+    for chunk in _chunk_list(sorted(COINGECKO_COIN_IDS), 200):
+        params = {
+            "vs_currency": "usd",
+            "ids": ",".join(chunk),
+            "order": "market_cap_desc",
+            "sparkline": "false",
+            "price_change_percentage": "1h,24h",
+            "per_page": len(chunk),
+            "page": 1,
+        }
+        data = _get_json_with_backoff(url, params)
+        if isinstance(data, list):
+            all_rows.extend(data)
+
+    _last_markets = all_rows
+    _last_markets_ts = now
+    return all_rows
+
+def fetch_simple_price_usd(coin_ids):
+    if not coin_ids:
+        return {}
+    coin_ids = list(dict.fromkeys(coin_ids))[:200]
+
+    url = f"{COINGECKO_BASE_URL}/simple/price"
+    params = {"ids": ",".join(coin_ids), "vs_currencies": "usd"}
+    data = _get_json_with_backoff(url, params)
+    return {k: v.get("usd") for k, v in data.items()}
+
+# ======================
+# COINGECKO OHLC CANDLES (replaces Binance)
+# ======================
+def fetch_coingecko_ohlc_usd(coin_id: str, days: int = COINGECKO_OHLC_DAYS):
+    """
+    Returns highs, lows, closes arrays from CoinGecko OHLC.
+    Endpoint returns rows: [timestamp, open, high, low, close]
+    Cached to reduce API calls.
+    Fail-safe returns (None, None, None).
+    """
+    if not coin_id:
+        return None, None, None
+
+    now = time.time()
+    cached = _ohlc_cache.get(coin_id)
+    if cached and (now - cached[0]) < COINGECKO_OHLC_CACHE_TTL_SECONDS:
         return cached[1], cached[2], cached[3]
 
-    pair = f"{symbol_upper}USDT"
-    url = "https://api.binance.com/api/v3/klines"
-    params = {"symbol": pair, "interval": interval, "limit": limit}
+    url = f"{COINGECKO_BASE_URL}/coins/{coin_id}/ohlc"
+    params = {"vs_currency": "usd", "days": int(days)}
 
-    delay = 2
-    for _ in range(BINANCE_MAX_RETRIES):
-        try:
-            r = SESSION.get(url, params=params, timeout=BINANCE_TIMEOUT)
-            if r.status_code in (418, 429):
-                time.sleep(delay)
-                delay = min(delay * 2, 20)
+    try:
+        rows = _get_json_with_backoff(url, params)
+        if not isinstance(rows, list) or len(rows) < 20:
+            return None, None, None
+
+        highs, lows, closes = [], [], []
+        for r in rows:
+            # [ts, open, high, low, close]
+            if not isinstance(r, (list, tuple)) or len(r) < 5:
                 continue
-            if r.status_code == 400:
-                return None, None, None
-            r.raise_for_status()
-            rows = r.json()
-            highs = [float(x[2]) for x in rows]
-            lows = [float(x[3]) for x in rows]
-            closes = [float(x[4]) for x in rows]
-            if len(closes) < 20:
-                return None, None, None
+            try:
+                highs.append(float(r[2]))
+                lows.append(float(r[3]))
+                closes.append(float(r[4]))
+            except Exception:
+                continue
 
-            _binance_cache[cache_key] = (now, highs, lows, closes)
-            return highs, lows, closes
-        except Exception:
-            time.sleep(delay)
-            delay = min(delay * 2, 20)
+        if len(closes) < 20:
+            return None, None, None
 
-    return None, None, None
+        _ohlc_cache[coin_id] = (now, highs, lows, closes)
+        return highs, lows, closes
+    except Exception:
+        return None, None, None
 
 # ======================
 # ATR + BOT LEVELS (caps are fallback-only)
@@ -256,7 +351,7 @@ def build_levels_from_candles(entry, side, highs, lows, closes, use_caps: bool =
         # bot ATR targets
         tp1 = entry + 0.60 * atr
         tp2 = entry + 1.00 * atr
-        tp3 = entry + 1.60 * atr  # a bit more upside; still validated by structure
+        tp3 = entry + 1.60 * atr
 
         # structure sanity (always)
         tp1 = min(tp1, recent_high * 0.995)
@@ -268,8 +363,6 @@ def build_levels_from_candles(entry, side, highs, lows, closes, use_caps: bool =
             tp1 = min(tp1, entry * (1.0 + TP1_CAP_FALLBACK))
             tp2 = min(tp2, entry * (1.0 + TP2_CAP_FALLBACK))
 
-            # dynamic TP3 (bot decides) but capped for safety
-            # choose cap from volatility: ~1.8*ATR as pct, but never above TP3_CAP_MAX_FALLBACK
             tp3_pct = min(TP3_CAP_MAX_FALLBACK, max(TP2_CAP_FALLBACK + 0.01, (1.8 * atr) / max(1e-12, entry)))
             tp3 = min(tp3, entry * (1.0 + tp3_pct))
 
@@ -354,7 +447,8 @@ def _rr_to_tp1(side, entry, sl, tp1):
 def ai_levels_better(side, entry, fallback_levels, candidate_levels):
     """
     Apply AI levels only if they look 'better' (simple rule):
-    - RR to TP1 is not worse, OR TP3 improves without worsening risk
+    - RR to TP1 is not worse
+    - Risk is not materially larger
     """
     try:
         f_sl, f_tp1, f_tp2, f_tp3 = fallback_levels
@@ -365,15 +459,12 @@ def ai_levels_better(side, entry, fallback_levels, candidate_levels):
     f_rr = _rr_to_tp1(side, entry, f_sl, f_tp1)
     a_rr = _rr_to_tp1(side, entry, a_sl, a_tp1)
 
-    # If RR can't be computed, be conservative: don't switch.
     if f_rr is None or a_rr is None:
         return False
 
-    # Require AI RR to be at least as good (tiny tolerance)
     if a_rr + 1e-9 < f_rr:
         return False
 
-    # Also avoid AI making risk massively bigger
     if side == "LONG":
         f_risk = entry - f_sl
         a_risk = entry - a_sl
@@ -384,7 +475,6 @@ def ai_levels_better(side, entry, fallback_levels, candidate_levels):
     if a_risk > f_risk * 1.15:
         return False
 
-    # Prefer if TP3 is improved (optional), but not required if RR ok
     return True
 
 # ======================
@@ -571,97 +661,6 @@ def send_long_message(text):
     for p in parts:
         send_message(p)
         time.sleep(1.2)
-
-# ======================
-# COINGECKO SAFE HTTP (fixed: never ends with None)
-# ======================
-def _get_json_with_backoff(url, params):
-    delay = 5
-    last_err = "unknown"
-
-    for attempt in range(1, COINGECKO_MAX_RETRIES + 1):
-        try:
-            r = SESSION.get(url, params=params, timeout=COINGECKO_TIMEOUT)
-
-            if r.status_code == 401:
-                last_err = "HTTP 401 Unauthorized (check COINGECKO_API_KEY / plan / base URL)"
-                raise RuntimeError(last_err)
-
-            if r.status_code == 429:
-                retry_after = r.headers.get("Retry-After")
-                ra = None
-                if retry_after:
-                    try:
-                        ra = int(retry_after)
-                    except Exception:
-                        ra = None
-
-                # ✅ ALWAYS set last_err on 429 so it can never be None
-                body_snip = (r.text[:200] if getattr(r, "text", None) else "")
-                last_err = f"HTTP 429 rate limited retry_after={ra} body={body_snip}"
-
-                sleep_for = max(delay, ra or 0)
-                sleep_for = min(sleep_for, 120)
-                time.sleep(sleep_for)
-                delay = min(delay * 2, 120)
-                continue
-
-            if r.status_code >= 400:
-                body_snip = (r.text[:200] if getattr(r, "text", None) else "")
-                last_err = f"HTTP {r.status_code} body={body_snip}"
-                r.raise_for_status()
-
-            return r.json()
-
-        except Exception as e:
-            last_err = repr(e)
-            time.sleep(delay)
-            delay = min(delay * 2, 120)
-
-    raise RuntimeError(f"CoinGecko request failed after retries: {last_err}")
-
-def _chunk_list(items, chunk_size):
-    items = list(items)
-    for i in range(0, len(items), chunk_size):
-        yield items[i:i + chunk_size]
-
-def fetch_whitelist_markets():
-    global _last_markets, _last_markets_ts
-
-    now = time.time()
-    if _last_markets and (now - _last_markets_ts) < MARKETS_CACHE_TTL_SECONDS:
-        return _last_markets
-
-    url = f"{COINGECKO_BASE_URL}/coins/markets"
-
-    all_rows = []
-    for chunk in _chunk_list(sorted(COINGECKO_COIN_IDS), 200):
-        params = {
-            "vs_currency": "usd",
-            "ids": ",".join(chunk),
-            "order": "market_cap_desc",
-            "sparkline": "false",
-            "price_change_percentage": "1h,24h",
-            "per_page": len(chunk),
-            "page": 1,
-        }
-        data = _get_json_with_backoff(url, params)
-        if isinstance(data, list):
-            all_rows.extend(data)
-
-    _last_markets = all_rows
-    _last_markets_ts = now
-    return all_rows
-
-def fetch_simple_price_usd(coin_ids):
-    if not coin_ids:
-        return {}
-    coin_ids = list(dict.fromkeys(coin_ids))[:200]
-
-    url = f"{COINGECKO_BASE_URL}/simple/price"
-    params = {"ids": ",".join(coin_ids), "vs_currencies": "usd"}
-    data = _get_json_with_backoff(url, params)
-    return {k: v.get("usd") for k, v in data.items()}
 
 # ======================
 # CORE LOGIC
@@ -885,28 +884,27 @@ def scan_and_collect(conn):
             notes.append(mem_note)
 
         # --------------------------
-        # Levels: BOT FIRST (no caps)
+        # Candles: CoinGecko OHLC
         # --------------------------
-        highs, lows, closes = fetch_binance_klines_usdt(sym, interval="1h", limit=120)
+        highs, lows, closes = fetch_coingecko_ohlc_usd(coin_id, days=COINGECKO_OHLC_DAYS)
 
+        # Bot tries primary levels (no caps)
         levels = build_levels_from_candles(entry, side, highs, lows, closes, use_caps=False)
-        atr_val = _atr(highs, lows, closes, period=14) if levels else None
+        atr_val = _atr(highs, lows, closes, period=14) if highs and lows and closes else None
 
-        # If bot couldn't decide, fallback to capped mode (still using Binance data)
-        if not levels:
+        # If bot couldn't decide, fallback to capped mode (still using CoinGecko candles)
+        if not levels and highs and lows and closes:
             levels = build_levels_from_candles(entry, side, highs, lows, closes, use_caps=True)
-            if levels and atr_val is None:
-                atr_val = _atr(highs, lows, closes, period=14)
+            notes.append("Fallback caps used (no valid levels from candles)")
 
-        # If still no levels, fallback to CoinGecko 24h high/low WITH CAPS (fallback-only)
-        used_caps_fallback = False
+        # If still no levels (e.g., OHLC missing), fallback to CoinGecko 24h high/low WITH CAPS
         if not levels:
             high_24h = c.get("high_24h")
             low_24h = c.get("low_24h")
             if high_24h is None or low_24h is None or high_24h <= 0 or low_24h <= 0:
                 continue
 
-            used_caps_fallback = True
+            notes.append("Fallback caps used (candles unavailable)")
 
             if side == "LONG":
                 sl = low_24h * 0.997
@@ -946,9 +944,6 @@ def scan_and_collect(conn):
         final_conf = conf_after_mem
         ai_applied = False
 
-        if used_caps_fallback:
-            notes.append("Fallback caps used (bot couldn't decide levels)")
-
         if ai_enabled():
             try:
                 mem_total, mem_wr = get_recent_side_performance(conn, sym, side)
@@ -975,7 +970,6 @@ def scan_and_collect(conn):
 
                 final_conf = max(0, min(100, conf_after_mem + int(adj)))
 
-                # Validate + compare
                 if atr_val is not None and ai_levels:
                     candidate = validate_ai_levels(
                         side=side,
@@ -993,10 +987,6 @@ def scan_and_collect(conn):
                     notes.append(f"AI: {reason} ({int(adj):+d})")
                 if ai_applied:
                     notes.append("✅ AI levels applied")
-                else:
-                    # only add this if you want it visible every time AI doesn't change levels
-                    # notes.append("AI suggestion not applied (kept bot levels)")
-                    pass
 
             except Exception:
                 final_conf = conf_after_mem
@@ -1062,6 +1052,7 @@ def main():
         f"⏱ Scan interval: {SCAN_EVERY_SECONDS}s\n"
         f"🤖 AI Filter: {ai_status}\n"
         f"🧾 CoinGecko Whitelist: {len(COINGECKO_COIN_IDS)} coins ✅\n"
+        f"🕯️ Candles: CoinGecko OHLC ({COINGECKO_OHLC_DAYS}d) ✅\n"
         "🧠 Decision Memory: ON ✅\n"
         "🕒 Persistent Cooldowns: ON ✅\n"
         "📩 Telegram Chunking: ON ✅\n"
