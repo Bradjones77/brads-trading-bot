@@ -1018,6 +1018,7 @@ def scan_and_collect(conn):
         if final_conf < CONFIDENCE_MIN:
             continue
 
+        # ✅ Persist cooldown + save
         set_cooldown(conn, sym, side, cooldown_cache)
         insert_trade(conn, ts_iso, sym, coin_id, coin_name, side, entry, sl, tp1, tp2, tp3, final_conf, chg1h, chg24)
 
