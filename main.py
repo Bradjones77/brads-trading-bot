@@ -1,6 +1,5 @@
 import os
 import time
-import math
 import requests
 import psycopg2
 from datetime import datetime, timezone, timedelta
@@ -23,10 +22,8 @@ BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
 CHAT_ID = (os.getenv("CHAT_ID") or "").strip()
 DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip()
 
-# ✅ CoinGecko Pro (Basic/Analyst both use the same auth header)
 COINGECKO_API_KEY = (os.getenv("COINGECKO_API_KEY") or "").strip()
 
-# ✅ FIX: strip() removes hidden spaces/newlines (prevents %0A in URLs)
 COINGECKO_BASE_URL = (os.getenv(
     "COINGECKO_BASE_URL",
     "https://pro-api.coingecko.com/api/v3"
@@ -45,52 +42,44 @@ if not COINGECKO_BASE_URL.startswith("http"):
 # SETTINGS
 # ======================
 SCAN_EVERY_SECONDS = int(os.getenv("SCAN_EVERY_SECONDS", "600"))  # default scan every 10 minutes
-CONFIDENCE_MIN = 65
-MAX_SIGNALS_PER_HOUR = 10
+CONFIDENCE_MIN = int(os.getenv("CONFIDENCE_MIN", "65"))
+MAX_SIGNALS_PER_HOUR = int(os.getenv("MAX_SIGNALS_PER_HOUR", "10"))
 
-# Momentum thresholds
-MIN_24H = 1.5
-MIN_1H = 0.4
+MIN_24H = float(os.getenv("MIN_24H", "1.5"))
+MIN_1H = float(os.getenv("MIN_1H", "0.4"))
 
-# Cooldown per symbol+side (persistent via DB)
-ALERT_COOLDOWN_SECONDS = 60 * 60  # 1 hour
+ALERT_COOLDOWN_SECONDS = int(os.getenv("ALERT_COOLDOWN_SECONDS", str(60 * 60)))
 
-# In-memory fallback cooldown
 last_alert_time = {}
-
-# Pending hourly bucket
 pending_signals = []
 pending_keys = set()
 
-# Memory rules
-MEM_STRICT_MIN_TRADES = 6
-MEM_STRICT_BLOCK_BELOW_WINRATE = 0.30
-MEM_SOFT_MIN_TRADES = 4
-MEM_SOFT_PENALIZE_BELOW_WINRATE = 0.45
-MEM_SOFT_PENALTY = -10
-MEM_LOOKBACK_DAYS = 14
+MEM_STRICT_MIN_TRADES = int(os.getenv("MEM_STRICT_MIN_TRADES", "6"))
+MEM_STRICT_BLOCK_BELOW_WINRATE = float(os.getenv("MEM_STRICT_BLOCK_BELOW_WINRATE", "0.30"))
+MEM_SOFT_MIN_TRADES = int(os.getenv("MEM_SOFT_MIN_TRADES", "4"))
+MEM_SOFT_PENALIZE_BELOW_WINRATE = float(os.getenv("MEM_SOFT_PENALIZE_BELOW_WINRATE", "0.45"))
+MEM_SOFT_PENALTY = int(os.getenv("MEM_SOFT_PENALTY", "-10"))
+MEM_LOOKBACK_DAYS = int(os.getenv("MEM_LOOKBACK_DAYS", "14"))
 
-# CoinGecko rate protection
-COINGECKO_TIMEOUT = 30
-COINGECKO_MAX_RETRIES = 6
+COINGECKO_TIMEOUT = int(os.getenv("COINGECKO_TIMEOUT", "30"))
+COINGECKO_MAX_RETRIES = int(os.getenv("COINGECKO_MAX_RETRIES", "6"))
 
 MARKETS_CACHE_TTL_SECONDS = int(os.getenv("MARKETS_CACHE_TTL_SECONDS", str(20 * 60)))
 _last_markets = None
 _last_markets_ts = 0
 
-OPEN_TRADES_CHECK_EVERY_SECONDS = 30 * 60
+OPEN_TRADES_CHECK_EVERY_SECONDS = int(os.getenv("OPEN_TRADES_CHECK_EVERY_SECONDS", str(30 * 60)))
 _last_open_check_ts = 0
 
-# Telegram limits (important!)
-TELEGRAM_MAX_CHARS = 3900  # keep under 4096 to be safe
-TELEGRAM_SEND_RETRIES = 4
+TELEGRAM_MAX_CHARS = int(os.getenv("TELEGRAM_MAX_CHARS", "3900"))
+TELEGRAM_SEND_RETRIES = int(os.getenv("TELEGRAM_SEND_RETRIES", "4"))
 
 # ======================
 # TAKE PROFIT FALLBACK CAPS (ONLY used when bot can't decide)
 # ======================
-TP1_CAP_FALLBACK = 0.035     # 3.5%
-TP2_CAP_FALLBACK = 0.055     # 5.5%
-TP3_CAP_MAX_FALLBACK = 0.12  # 12% safety ceiling for dynamic TP3 fallback
+TP1_CAP_FALLBACK = float(os.getenv("TP1_CAP_FALLBACK", "0.035"))     # 3.5%
+TP2_CAP_FALLBACK = float(os.getenv("TP2_CAP_FALLBACK", "0.055"))     # 5.5%
+TP3_CAP_MAX_FALLBACK = float(os.getenv("TP3_CAP_MAX_FALLBACK", "0.12"))  # 12% safety ceiling
 
 # ======================
 # COINGECKO OHLC SETTINGS (candles source)
@@ -103,23 +92,21 @@ _ohlc_cache = {}  # coin_id -> (ts, highs, lows, closes)
 # ======================
 # AI LEVEL OVERRIDE RULE (SAFETY)
 # ======================
-# ✅ AI can suggest SL/TP ONLY when main.py explicitly requests it.
-# We request it ONLY when we are using fallback caps (i.e. bot couldn't decide cleanly).
+# ✅ AI can suggest SL/TP ONLY when we explicitly request it (request_ai_levels=True).
+# We request it ONLY when fallback caps were used (i.e. bot couldn't decide cleanly).
 AI_REQUEST_LEVELS_ONLY_ON_FALLBACK = (os.getenv("AI_REQUEST_LEVELS_ONLY_ON_FALLBACK", "1").strip() == "1")
 
+# ======================
 # Requests session
+# ======================
 SESSION = requests.Session()
 SESSION.headers.update({
-    "User-Agent": "brads-trading-bot/2.6 (coingecko-ohlc; AI-levels-safe; caps-fallback-only; whitelist; rate-safe)",
+    "User-Agent": "brads-trading-bot/2.7 (coingecko-ohlc; ai-proof; db-safe; whitelist; rate-safe)",
     "accept": "application/json",
-    # ✅ CoinGecko Pro key is sent via header (NOT in URL)
     "x-cg-pro-api-key": COINGECKO_API_KEY
 })
 
 def coingecko_self_test():
-    """
-    Startup test so you KNOW the CoinGecko API is working.
-    """
     url = f"{COINGECKO_BASE_URL}/ping"
     r = SESSION.get(url, timeout=15)
     r.raise_for_status()
@@ -129,46 +116,35 @@ def coingecko_self_test():
 # COINGECKO WHITELIST (YOUR LIST)
 # ==============================
 COINGECKO_COIN_IDS = {
-    # Majors / L1
     "bitcoin", "ethereum", "binancecoin", "ripple", "solana", "cardano", "dogecoin",
     "tron", "bitcoin-cash", "litecoin", "polkadot", "avalanche-2", "cosmos",
     "stellar", "ethereum-classic", "internet-computer", "near", "algorand", "aptos",
     "filecoin", "vechain", "hedera-hashgraph", "zcash", "monero",
 
-    # DeFi / Core Infra
     "chainlink", "uniswap", "aave", "pancakeswap-token", "curve-dao-token",
     "synthetix-network-token", "compound-governance-token", "injective-protocol",
     "lido-dao", "morpho", "dydx", "the-graph", "reserve-rights-token", "qtum",
     "kyber-network-crystal", "loopring", "bancor", "0x", "gnosis", "band-protocol",
 
-    # Layer 2 / Scaling / Modular
-    "arbitrum", "optimism", "stacks", "starknet", "layerzero", "celestia", "skale",
-    "osmosis",
+    "arbitrum", "optimism", "stacks", "starknet", "layerzero", "celestia", "skale", "osmosis",
 
-    # AI / Compute / Data
     "bittensor", "render-token", "fetch-ai", "io-net", "numeraire",
 
-    # Memes
     "shiba-inu", "pepe", "bonk", "floki", "dogwifcoin", "cheems-token",
     "book-of-meme", "peanut-the-squirrel", "official-trump",
 
-    # Exchange / Wallet Tokens
     "trust-wallet-token", "nexo", "kucoin-shares", "okb", "gatechain-token", "htx",
     "mx-token", "bitget-token",
 
-    # Payments / Utility / Legacy
     "xdc-network", "iota", "dash", "horizen", "siacoin", "holo", "ravencoin",
     "verge", "zilliqa", "theta-fuel", "theta-token", "basic-attention-token",
 
-    # Gaming / NFT / Metaverse
     "axie-infinity", "apecoin", "the-sandbox", "gala", "immutable-x",
     "yield-guild-games", "open-campus",
 
-    # Stables (shared + liquid)
     "tether", "usd-coin", "dai", "true-usd", "first-digital-usd", "ethena-usde",
     "ripple-usd", "frax", "paypal-usd",
 
-    # Other Valid Overlaps
     "jasmycoin", "kite", "walrus", "sonic", "safepal", "space-id", "magic-eden",
     "power-ledger", "audius", "flux", "ontology-gas", "saga", "origin-protocol",
     "civic", "everipedia", "stratis", "wax", "cyberconnect", "amp-token",
@@ -176,12 +152,11 @@ COINGECKO_COIN_IDS = {
 }
 
 # ======================
-# COINGECKO SAFE HTTP (fixed: never ends with None)
+# COINGECKO SAFE HTTP
 # ======================
 def _get_json_with_backoff(url, params):
     delay = 5
     last_err = "unknown"
-
     for attempt in range(1, COINGECKO_MAX_RETRIES + 1):
         try:
             r = SESSION.get(url, params=params, timeout=COINGECKO_TIMEOUT)
@@ -198,10 +173,8 @@ def _get_json_with_backoff(url, params):
                         ra = int(retry_after)
                     except Exception:
                         ra = None
-
                 body_snip = (r.text[:200] if getattr(r, "text", None) else "")
                 last_err = f"HTTP 429 rate limited retry_after={ra} body={body_snip}"
-
                 sleep_for = max(delay, ra or 0)
                 sleep_for = min(sleep_for, 120)
                 time.sleep(sleep_for)
@@ -229,13 +202,11 @@ def _chunk_list(items, chunk_size):
 
 def fetch_whitelist_markets():
     global _last_markets, _last_markets_ts
-
     now = time.time()
     if _last_markets and (now - _last_markets_ts) < MARKETS_CACHE_TTL_SECONDS:
         return _last_markets
 
     url = f"{COINGECKO_BASE_URL}/coins/markets"
-
     all_rows = []
     for chunk in _chunk_list(sorted(COINGECKO_COIN_IDS), 200):
         params = {
@@ -259,7 +230,6 @@ def fetch_simple_price_usd(coin_ids):
     if not coin_ids:
         return {}
     coin_ids = list(dict.fromkeys(coin_ids))[:200]
-
     url = f"{COINGECKO_BASE_URL}/simple/price"
     params = {"ids": ",".join(coin_ids), "vs_currencies": "usd"}
     data = _get_json_with_backoff(url, params)
@@ -269,12 +239,6 @@ def fetch_simple_price_usd(coin_ids):
 # COINGECKO OHLC CANDLES
 # ======================
 def fetch_coingecko_ohlc_usd(coin_id: str, days: int = COINGECKO_OHLC_DAYS):
-    """
-    Returns highs, lows, closes arrays from CoinGecko OHLC.
-    Endpoint returns rows: [timestamp, open, high, low, close]
-    Cached to reduce API calls.
-    Fail-safe returns (None, None, None).
-    """
     if not coin_id:
         return None, None, None
 
@@ -293,7 +257,6 @@ def fetch_coingecko_ohlc_usd(coin_id: str, days: int = COINGECKO_OHLC_DAYS):
 
         highs, lows, closes = [], [], []
         for r in rows:
-            # [ts, open, high, low, close]
             if not isinstance(r, (list, tuple)) or len(r) < 5:
                 continue
             try:
@@ -312,7 +275,7 @@ def fetch_coingecko_ohlc_usd(coin_id: str, days: int = COINGECKO_OHLC_DAYS):
         return None, None, None
 
 # ======================
-# ATR + BOT LEVELS (caps are fallback-only)
+# ATR + BOT LEVELS
 # ======================
 def _atr(highs, lows, closes, period=14):
     try:
@@ -337,10 +300,6 @@ def _atr(highs, lows, closes, period=14):
         return None
 
 def build_levels_from_candles(entry, side, highs, lows, closes, use_caps: bool = False):
-    """
-    ✅ Primary (use_caps=False): bot decides using ATR + structure (NO hard % caps).
-    ✅ Fallback (use_caps=True): apply % caps (TP1 3.5%, TP2 5.5%, TP3 dynamic capped).
-    """
     if entry is None or highs is None or lows is None or closes is None:
         return None
 
@@ -401,10 +360,6 @@ def build_levels_from_candles(entry, side, highs, lows, closes, use_caps: bool =
         return sl, tp1, tp2, tp3
 
 def validate_ai_levels(side, entry, atr_value, fallback_levels, ai_levels):
-    """
-    AI can suggest SL/TPs ONLY.
-    Bot applies AI ONLY if valid under ATR safety rails; otherwise uses fallback.
-    """
     if not ai_levels:
         return fallback_levels
 
@@ -453,11 +408,6 @@ def _rr_to_tp1(side, entry, sl, tp1):
         return None
 
 def ai_levels_better(side, entry, fallback_levels, candidate_levels):
-    """
-    Apply AI levels only if they look 'better' (simple rule):
-    - RR to TP1 is not worse
-    - Risk is not materially larger
-    """
     try:
         f_sl, f_tp1, f_tp2, f_tp3 = fallback_levels
         a_sl, a_tp1, a_tp2, a_tp3 = candidate_levels
@@ -489,9 +439,6 @@ def ai_levels_better(side, entry, fallback_levels, candidate_levels):
 # DATABASE
 # ======================
 def _ensure_schema(conn):
-    """
-    Adds optional columns safely so you can SEE where TP/SL came from.
-    """
     cur = conn.cursor()
     try:
         cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS levels_source TEXT")
@@ -552,19 +499,40 @@ def insert_trade(
     ai_reason=None
 ):
     cur = conn.cursor()
+
+    # Try new-schema insert first; if DB hasn't been altered yet, fallback to old insert.
+    try:
+        cur.execute("""
+            INSERT INTO trades (
+                ts_utc, symbol, coin_id, coin_name, side,
+                entry, stop_loss, tp1, tp2, tp3,
+                confidence, chg1h, chg24,
+                levels_source, ai_requested, ai_applied, ai_reason
+            )
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """, (
+            ts_utc, symbol, coin_id, coin_name, side,
+            entry, sl, tp1, tp2, tp3,
+            conf, chg1h, chg24,
+            levels_source, ai_requested, ai_applied, ai_reason
+        ))
+        conn.commit()
+        return
+    except Exception:
+        conn.rollback()
+
+    # Old insert (always works)
     cur.execute("""
         INSERT INTO trades (
             ts_utc, symbol, coin_id, coin_name, side,
             entry, stop_loss, tp1, tp2, tp3,
-            confidence, chg1h, chg24,
-            levels_source, ai_requested, ai_applied, ai_reason
+            confidence, chg1h, chg24
         )
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
     """, (
         ts_utc, symbol, coin_id, coin_name, side,
         entry, sl, tp1, tp2, tp3,
-        conf, chg1h, chg24,
-        levels_source, ai_requested, ai_applied, ai_reason
+        conf, chg1h, chg24
     ))
     conn.commit()
 
@@ -655,7 +623,7 @@ def should_alert_fallback_ram(symbol, side):
     return True
 
 # ======================
-# TELEGRAM (SAFE SEND + CHUNKING)
+# TELEGRAM
 # ======================
 def _telegram_post(text, parse_mode="Markdown"):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -706,14 +674,11 @@ def send_long_message(text):
         time.sleep(1.2)
 
 # ======================
-# CORE LOGIC
+# CORE
 # ======================
 def score(chg24, chg1h):
     return max(0, min(100, int(abs(chg24) * 6 + abs(chg1h) * 30)))
 
-# ======================
-# DECISION MEMORY
-# ======================
 def get_recent_side_performance(conn, symbol, side):
     try:
         cur = conn.cursor()
@@ -747,18 +712,15 @@ def apply_memory_rules(conn, symbol, side):
         return False, 0, None
 
     if total >= MEM_STRICT_MIN_TRADES and winrate < MEM_STRICT_BLOCK_BELOW_WINRATE:
-        note = f"Blocked by memory: {total} trades, {winrate*100:.0f}% win (last {MEM_LOOKBACK_DAYS}d)"
+        note = f"Blocked by memory: {total} trades, {winrate*100:.0f}% win ({MEM_LOOKBACK_DAYS}d)"
         return True, 0, note
 
     if total >= MEM_SOFT_MIN_TRADES and winrate < MEM_SOFT_PENALIZE_BELOW_WINRATE:
-        note = f"Memory penalty: {total} trades, {winrate*100:.0f}% win (last {MEM_LOOKBACK_DAYS}d)"
+        note = f"Memory penalty: {total} trades, {winrate*100:.0f}% win ({MEM_LOOKBACK_DAYS}d)"
         return False, MEM_SOFT_PENALTY, note
 
     return False, 0, None
 
-# ======================
-# AI CONTEXT
-# ======================
 def build_ai_context(
     coin_name, sym, side, entry, sl, tp1, tp2, tp3,
     base_conf, chg1h, chg24, atr_value,
@@ -767,13 +729,12 @@ def build_ai_context(
 ):
     action = "BUY" if side == "LONG" else "SELL"
     rr_tp1 = _rr_to_tp1(side, entry, sl, tp1)
-
     return {
         "coin": coin_name,
         "symbol": sym,
         "direction": side,
         "action": action,
-        "entry": entry,  # ✅ bot-controlled entry (AI must not change)
+        "entry": entry,
         "stop_loss": sl,
         "tp1": tp1,
         "tp2": tp2,
@@ -789,12 +750,9 @@ def build_ai_context(
             "win_rate": mem_winrate
         },
         "request_ai_levels": bool(request_ai_levels),
-        "rule": "AI may suggest SL/TP only. Entry must remain bot-controlled."
+        "rule": "AI may suggest SL/TP only. Entry is bot-controlled."
     }
 
-# ======================
-# MESSAGE FORMAT
-# ======================
 def fmt_price(p):
     return f"${p:,.6f}" if p < 1 else f"${p:,.2f}"
 
@@ -831,9 +789,6 @@ def format_hourly_header(conn, time_str):
         f"━━━━━━━━━━━━━━"
     )
 
-# ======================
-# TRADE OUTCOME TRACKING
-# ======================
 def update_open_trades(conn):
     global _last_open_check_ts
     now = time.time()
@@ -872,9 +827,6 @@ def update_open_trades(conn):
             elif px <= tp1:
                 close_trade(conn, trade_id, "WIN")
 
-# ======================
-# SCAN + COLLECT (WHITELIST ONLY)
-# ======================
 def scan_and_collect(conn):
     global pending_signals, pending_keys
 
@@ -907,7 +859,7 @@ def scan_and_collect(conn):
         if not sym:
             continue
 
-        # cooldown (DB; RAM fallback)
+        # cooldown
         try:
             if not cooldown_ok(sym, side, cooldown_cache):
                 continue
@@ -932,26 +884,22 @@ def scan_and_collect(conn):
         if mem_note:
             notes.append(mem_note)
 
-        # --------------------------
-        # Candles: CoinGecko OHLC
-        # --------------------------
         highs, lows, closes = fetch_coingecko_ohlc_usd(coin_id, days=COINGECKO_OHLC_DAYS)
-
         atr_val = _atr(highs, lows, closes, period=14) if highs and lows and closes else None
 
-        # Bot tries primary levels (no caps)
+        # Bot primary levels (no caps)
         levels_source = "BOT_CANDLES"
         levels = build_levels_from_candles(entry, side, highs, lows, closes, use_caps=False)
 
-        # If bot couldn't decide, fallback to capped mode (still using CoinGecko candles)
         used_fallback_caps = False
+
+        # Fallback caps using candles if bot couldn't decide
         if not levels and highs and lows and closes:
             used_fallback_caps = True
             levels_source = "FALLBACK_CAPS_CANDLES"
             levels = build_levels_from_candles(entry, side, highs, lows, closes, use_caps=True)
-            notes.append("Fallback caps used (no valid levels from candles)")
 
-        # If still no levels, fallback to CoinGecko 24h high/low WITH CAPS
+        # Fallback caps using 24h high/low if no candles
         if not levels:
             used_fallback_caps = True
             levels_source = "FALLBACK_CAPS_24H"
@@ -960,32 +908,24 @@ def scan_and_collect(conn):
             if high_24h is None or low_24h is None or high_24h <= 0 or low_24h <= 0:
                 continue
 
-            notes.append("Fallback caps used (candles unavailable)")
-
             if side == "LONG":
                 sl = low_24h * 0.997
                 if sl >= entry:
                     continue
-
                 tp1 = min(entry * (1.0 + TP1_CAP_FALLBACK), high_24h * 0.995)
                 tp2 = min(entry * (1.0 + TP2_CAP_FALLBACK), high_24h * 1.000)
-
                 tp3_cap_dynamic = entry * (1.0 + TP3_CAP_MAX_FALLBACK)
                 tp3 = min(tp3_cap_dynamic, high_24h * 1.005)
-
                 if not (sl < entry < tp1 < tp2 < tp3):
                     continue
             else:
                 sl = high_24h * 1.003
                 if sl <= entry:
                     continue
-
                 tp1 = max(entry * (1.0 - TP1_CAP_FALLBACK), low_24h * 1.005)
                 tp2 = max(entry * (1.0 - TP2_CAP_FALLBACK), low_24h * 1.000)
-
                 tp3_cap_dynamic = entry * (1.0 - TP3_CAP_MAX_FALLBACK)
                 tp3 = max(tp3_cap_dynamic, low_24h * 0.995)
-
                 if not (tp3 < tp2 < tp1 < entry < sl):
                     continue
 
@@ -993,31 +933,25 @@ def scan_and_collect(conn):
 
         sl, tp1, tp2, tp3 = levels
 
-        # --------------------------
-        # AI: may suggest SL/TP only
-        # Bot applies ONLY if valid + better; otherwise keeps bot levels.
-        # --------------------------
+        # Add a clear, non-spam proof line
+        notes.append(f"Levels: {levels_source}")
+
+        # AI logic
         final_conf = conf_after_mem
         ai_applied = False
         ai_requested = False
         ai_reason = None
 
-        # ✅ request AI levels ONLY when we are on fallback caps (unless you turn it off)
         if ai_enabled():
             try:
                 ai_requested = bool(used_fallback_caps and AI_REQUEST_LEVELS_ONLY_ON_FALLBACK)
-
-                if ai_requested:
-                    notes.append("🧠 AI requested to improve SL/TP (fallback mode)")
-                else:
-                    notes.append("🧠 AI not requested for SL/TP (bot levels kept)")
 
                 mem_total, mem_wr = get_recent_side_performance(conn, sym, side)
                 ctx = build_ai_context(
                     coin_name=coin_name,
                     sym=sym,
                     side=side,
-                    entry=entry,   # ✅ entry stays bot-controlled
+                    entry=entry,
                     sl=sl,
                     tp1=tp1,
                     tp2=tp2,
@@ -1040,7 +974,7 @@ def scan_and_collect(conn):
                     ai_reason = f"{reason} ({int(adj):+d})"
                     notes.append(f"AI: {ai_reason}")
 
-                # Apply AI only if we requested it AND ATR exists AND AI provided levels
+                # Apply AI only if requested + safe + better
                 if ai_requested and atr_val is not None and ai_levels:
                     candidate = validate_ai_levels(
                         side=side,
@@ -1049,24 +983,22 @@ def scan_and_collect(conn):
                         fallback_levels=(sl, tp1, tp2, tp3),
                         ai_levels=ai_levels
                     )
-
                     if candidate != (sl, tp1, tp2, tp3) and ai_levels_better(side, entry, (sl, tp1, tp2, tp3), candidate):
                         sl, tp1, tp2, tp3 = candidate
                         ai_applied = True
                         levels_source = "AI_APPLIED"
                         notes.append("✅ AI levels applied")
-                    else:
-                        notes.append("⚠️ AI levels NOT applied (failed safety/better check)")
+                    elif ai_requested:
+                        notes.append("⚠️ AI levels rejected (safety/better check)")
 
-            except Exception as e:
-                # Fail-safe: keep bot levels
-                notes.append(f"AI error -> kept bot levels")
+            except Exception:
                 final_conf = conf_after_mem
+                notes.append("AI error -> kept bot levels")
 
         if final_conf < CONFIDENCE_MIN:
             continue
 
-        # ✅ Persist cooldown + save
+        # Persist + save
         set_cooldown(conn, sym, side, cooldown_cache)
         insert_trade(
             conn,
@@ -1090,9 +1022,6 @@ def scan_and_collect(conn):
         if len(pending_signals) >= MAX_SIGNALS_PER_HOUR:
             break
 
-# ======================
-# HOURLY SEND
-# ======================
 def should_send_now(last_sent_hour):
     now = datetime.now(timezone.utc)
     hour_key = now.strftime("%Y-%m-%d %H")
@@ -1114,13 +1043,9 @@ def send_hourly_update(conn):
     pending_signals = []
     pending_keys = set()
 
-# ======================
-# MAIN LOOP
-# ======================
 def main():
     conn = db_connect()
 
-    # ✅ Run a quick test at startup (shows in Railway logs)
     try:
         coingecko_self_test()
     except Exception as e:
@@ -1134,11 +1059,8 @@ def main():
         f"🤖 AI Filter: {ai_status}\n"
         f"🧾 CoinGecko Whitelist: {len(COINGECKO_COIN_IDS)} coins ✅\n"
         f"🕯️ Candles: CoinGecko OHLC ({COINGECKO_OHLC_DAYS}d) ✅\n"
-        "🧠 Decision Memory: ON ✅\n"
-        "🕒 Persistent Cooldowns: ON ✅\n"
-        "📩 Telegram Chunking: ON ✅\n"
-        "🛟 TP caps are FALLBACK-ONLY (used only if bot can't decide)\n"
-        "🧾 Proof: bot logs + DB store levels_source / ai_requested / ai_applied\n"
+        "🛟 TP caps are FALLBACK-ONLY\n"
+        "🧾 Proof: message notes + DB columns levels_source / ai_requested / ai_applied\n"
         "_Not financial advice_"
     )
 
