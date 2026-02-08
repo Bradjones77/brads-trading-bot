@@ -1,7 +1,9 @@
 import os
 import time
+import traceback
 import requests
 import psycopg2
+from psycopg2 import OperationalError, InterfaceError
 from datetime import datetime, timezone, timedelta
 
 # ======================
@@ -41,7 +43,7 @@ if not COINGECKO_BASE_URL.startswith("http"):
 # ======================
 # SETTINGS
 # ======================
-SCAN_EVERY_SECONDS = int(os.getenv("SCAN_EVERY_SECONDS", "600"))  # default scan every 10 minutes
+SCAN_EVERY_SECONDS = int(os.getenv("SCAN_EVERY_SECONDS", "600"))  # scan every 10 minutes
 CONFIDENCE_MIN = int(os.getenv("CONFIDENCE_MIN", "65"))
 MAX_SIGNALS_PER_HOUR = int(os.getenv("MAX_SIGNALS_PER_HOUR", "10"))
 
@@ -77,29 +79,26 @@ TELEGRAM_SEND_RETRIES = int(os.getenv("TELEGRAM_SEND_RETRIES", "4"))
 # ======================
 # TAKE PROFIT FALLBACK CAPS (ONLY used when bot can't decide)
 # ======================
-TP1_CAP_FALLBACK = float(os.getenv("TP1_CAP_FALLBACK", "0.035"))     # 3.5%
-TP2_CAP_FALLBACK = float(os.getenv("TP2_CAP_FALLBACK", "0.055"))     # 5.5%
+TP1_CAP_FALLBACK = float(os.getenv("TP1_CAP_FALLBACK", "0.035"))       # 3.5%
+TP2_CAP_FALLBACK = float(os.getenv("TP2_CAP_FALLBACK", "0.055"))       # 5.5%
 TP3_CAP_MAX_FALLBACK = float(os.getenv("TP3_CAP_MAX_FALLBACK", "0.12"))  # 12% safety ceiling
 
 # ======================
-# COINGECKO OHLC SETTINGS (candles source)
+# COINGECKO OHLC SETTINGS
 # ======================
 COINGECKO_OHLC_DAYS = int(os.getenv("COINGECKO_OHLC_DAYS", "7"))
 COINGECKO_OHLC_CACHE_TTL_SECONDS = int(os.getenv("COINGECKO_OHLC_CACHE_TTL_SECONDS", str(10 * 60)))
 _ohlc_cache = {}  # coin_id -> (ts, highs, lows, closes)
 
 # ======================
-# AI LEVEL OVERRIDE RULE (SAFETY)
+# AI SAFETY MODES
 # ======================
 AI_REQUEST_LEVELS_ONLY_ON_FALLBACK = (os.getenv("AI_REQUEST_LEVELS_ONLY_ON_FALLBACK", "1").strip() == "1")
 
-# ======================
-# OPENAI SAFETY: ONLY CALL AI WHEN NEEDED (prevents 429 spam)
-# ======================
 AI_FILTER_MODE = (os.getenv("AI_FILTER_MODE", "levels_only") or "").strip().lower()
 # modes:
-# - "off"             = never call OpenAI
-# - "levels_only"     = call OpenAI ONLY when ai_requested=True (recommended)
+# - "off"               = never call OpenAI
+# - "levels_only"       = call OpenAI ONLY when ai_requested=True (recommended)
 # - "filter_and_levels" = call OpenAI for approve/reject always (more expensive)
 
 AI_MIN_CALL_INTERVAL_SECONDS = int(os.getenv("AI_MIN_CALL_INTERVAL_SECONDS", "2"))
@@ -127,7 +126,7 @@ def mark_ai_cooldown():
 # ======================
 SESSION = requests.Session()
 SESSION.headers.update({
-    "User-Agent": "brads-trading-bot/2.7 (coingecko-ohlc; ai-proof; db-safe; whitelist; rate-safe)",
+    "User-Agent": "brads-trading-bot/2.8 (db-reconnect; loop-safe; ai-rate-safe; coingecko-ohlc)",
     "accept": "application/json",
     "x-cg-pro-api-key": COINGECKO_API_KEY
 })
@@ -139,7 +138,7 @@ def coingecko_self_test():
     print("✅ CoinGecko OK:", r.json())
 
 # ==============================
-# COINGECKO WHITELIST (YOUR LIST)
+# COINGECKO WHITELIST
 # ==============================
 COINGECKO_COIN_IDS = {
     "bitcoin", "ethereum", "binancecoin", "ripple", "solana", "cardano", "dogecoin",
@@ -262,7 +261,7 @@ def fetch_simple_price_usd(coin_ids):
     return {k: v.get("usd") for k, v in data.items()}
 
 # ======================
-# COINGECKO OHLC CANDLES
+# COINGECKO OHLC
 # ======================
 def fetch_coingecko_ohlc_usd(coin_id: str, days: int = COINGECKO_OHLC_DAYS):
     if not coin_id:
@@ -301,7 +300,7 @@ def fetch_coingecko_ohlc_usd(coin_id: str, days: int = COINGECKO_OHLC_DAYS):
         return None, None, None
 
 # ======================
-# ATR + BOT LEVELS
+# ATR + LEVELS
 # ======================
 def _atr(highs, lows, closes, period=14):
     try:
@@ -339,7 +338,6 @@ def build_levels_from_candles(entry, side, highs, lows, closes, use_caps: bool =
 
     if side == "LONG":
         sl = min(entry - 1.10 * atr, recent_low - 0.20 * atr)
-
         tp1 = entry + 0.60 * atr
         tp2 = entry + 1.00 * atr
         tp3 = entry + 1.60 * atr
@@ -363,7 +361,6 @@ def build_levels_from_candles(entry, side, highs, lows, closes, use_caps: bool =
 
     else:  # SHORT
         sl = max(entry + 1.10 * atr, recent_high + 0.20 * atr)
-
         tp1 = entry - 0.55 * atr
         tp2 = entry - 0.90 * atr
         tp3 = entry - 1.45 * atr
@@ -461,7 +458,7 @@ def ai_levels_better(side, entry, fallback_levels, candidate_levels):
     return True
 
 # ======================
-# DATABASE
+# DATABASE (RECONNECT-SAFE)
 # ======================
 def _ensure_schema(conn):
     cur = conn.cursor()
@@ -475,43 +472,73 @@ def _ensure_schema(conn):
         conn.rollback()
 
 def db_connect():
-    conn = psycopg2.connect(DATABASE_URL)
-    cur = conn.cursor()
+    delay = 2
+    while True:
+        try:
+            conn = psycopg2.connect(DATABASE_URL)
+            conn.autocommit = False
+            cur = conn.cursor()
 
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS trades (
-            id SERIAL PRIMARY KEY,
-            ts_utc TEXT NOT NULL,
-            symbol TEXT NOT NULL,
-            coin_id TEXT NOT NULL,
-            coin_name TEXT NOT NULL,
-            side TEXT NOT NULL,
-            entry DOUBLE PRECISION NOT NULL,
-            stop_loss DOUBLE PRECISION NOT NULL,
-            tp1 DOUBLE PRECISION NOT NULL,
-            tp2 DOUBLE PRECISION NOT NULL,
-            tp3 DOUBLE PRECISION NOT NULL,
-            confidence INTEGER NOT NULL,
-            chg1h DOUBLE PRECISION,
-            chg24 DOUBLE PRECISION,
-            status TEXT NOT NULL DEFAULT 'OPEN',
-            result TEXT,
-            closed_ts_utc TEXT
-        )
-    """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS trades (
+                    id SERIAL PRIMARY KEY,
+                    ts_utc TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    coin_id TEXT NOT NULL,
+                    coin_name TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    entry DOUBLE PRECISION NOT NULL,
+                    stop_loss DOUBLE PRECISION NOT NULL,
+                    tp1 DOUBLE PRECISION NOT NULL,
+                    tp2 DOUBLE PRECISION NOT NULL,
+                    tp3 DOUBLE PRECISION NOT NULL,
+                    confidence INTEGER NOT NULL,
+                    chg1h DOUBLE PRECISION,
+                    chg24 DOUBLE PRECISION,
+                    status TEXT NOT NULL DEFAULT 'OPEN',
+                    result TEXT,
+                    closed_ts_utc TEXT
+                )
+            """)
 
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS cooldowns (
-            symbol TEXT NOT NULL,
-            side TEXT NOT NULL,
-            last_sent_ts TIMESTAMPTZ NOT NULL,
-            PRIMARY KEY (symbol, side)
-        )
-    """)
-    conn.commit()
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS cooldowns (
+                    symbol TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    last_sent_ts TIMESTAMPTZ NOT NULL,
+                    PRIMARY KEY (symbol, side)
+                )
+            """)
+            conn.commit()
 
-    _ensure_schema(conn)
-    return conn
+            _ensure_schema(conn)
+            print("✅ DB connected")
+            return conn
+
+        except Exception as e:
+            print("❌ DB connect failed, retrying:", repr(e))
+            time.sleep(delay)
+            delay = min(delay * 2, 30)
+
+def ensure_conn(conn):
+    try:
+        if conn is None or conn.closed != 0:
+            return db_connect()
+        cur = conn.cursor()
+        cur.execute("SELECT 1")
+        conn.commit()
+        return conn
+    except (OperationalError, InterfaceError) as e:
+        print("⚠️ DB connection lost, reconnecting:", repr(e))
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+        return db_connect()
+    except Exception as e:
+        print("⚠️ ensure_conn error:", repr(e))
+        return conn
 
 def insert_trade(
     conn,
@@ -524,7 +551,6 @@ def insert_trade(
     ai_reason=None
 ):
     cur = conn.cursor()
-
     try:
         cur.execute("""
             INSERT INTO trades (
@@ -545,7 +571,7 @@ def insert_trade(
     except Exception:
         conn.rollback()
 
-    # old insert fallback
+    # old insert fallback (if columns not present)
     cur.execute("""
         INSERT INTO trades (
             ts_utc, symbol, coin_id, coin_name, side,
@@ -911,19 +937,16 @@ def scan_and_collect(conn):
         highs, lows, closes = fetch_coingecko_ohlc_usd(coin_id, days=COINGECKO_OHLC_DAYS)
         atr_val = _atr(highs, lows, closes, period=14) if highs and lows and closes else None
 
-        # Bot primary levels (no caps)
         levels_source = "BOT_CANDLES"
         levels = build_levels_from_candles(entry, side, highs, lows, closes, use_caps=False)
 
         used_fallback_caps = False
 
-        # Fallback caps using candles if bot couldn't decide
         if not levels and highs and lows and closes:
             used_fallback_caps = True
             levels_source = "FALLBACK_CAPS_CANDLES"
             levels = build_levels_from_candles(entry, side, highs, lows, closes, use_caps=True)
 
-        # Fallback caps using 24h high/low if no candles
         if not levels:
             used_fallback_caps = True
             levels_source = "FALLBACK_CAPS_24H"
@@ -957,7 +980,6 @@ def scan_and_collect(conn):
 
         sl, tp1, tp2, tp3 = levels
 
-        # AI logic (safe-gated)
         final_conf = conf_after_mem
         ai_applied = False
         ai_requested = False
@@ -966,9 +988,6 @@ def scan_and_collect(conn):
         if ai_enabled() and AI_FILTER_MODE != "off":
             ai_requested = bool(used_fallback_caps and AI_REQUEST_LEVELS_ONLY_ON_FALLBACK)
 
-            # Only call AI if:
-            # - filter_and_levels => always
-            # - levels_only => only when requested (fallback case)
             want_ai_call = (
                 (AI_FILTER_MODE == "filter_and_levels") or
                 (AI_FILTER_MODE == "levels_only" and ai_requested)
@@ -986,7 +1005,7 @@ def scan_and_collect(conn):
                         tp1=tp1,
                         tp2=tp2,
                         tp3=tp3,
-                        base_conf=conf_after_mem,
+                        base_confidence=conf_after_mem,
                         chg1h=chg1h,
                         chg24=chg24,
                         atr_value=atr_val,
@@ -1004,7 +1023,6 @@ def scan_and_collect(conn):
                     if reason:
                         ai_reason = f"{reason} ({int(adj):+d})"
 
-                    # Apply AI only if requested + safe + better
                     if ai_requested and atr_val is not None and ai_levels:
                         candidate = validate_ai_levels(
                             side=side,
@@ -1027,14 +1045,10 @@ def scan_and_collect(conn):
                     else:
                         notes.append(f"AI error -> kept bot levels ({err[:120]})")
                     final_conf = conf_after_mem
-            else:
-                # no AI call
-                final_conf = conf_after_mem
 
         if final_conf < CONFIDENCE_MIN:
             continue
 
-        # Final proof notes (always correct)
         notes.append(f"Levels: {levels_source}")
         if ai_enabled() and AI_FILTER_MODE != "off":
             if ai_requested:
@@ -1044,7 +1058,6 @@ def scan_and_collect(conn):
             if ai_reason:
                 notes.append(f"AI: {ai_reason}")
 
-        # Persist + save
         set_cooldown(conn, sym, side, cooldown_cache)
         insert_trade(
             conn,
@@ -1089,13 +1102,13 @@ def send_hourly_update(conn):
     pending_signals = []
     pending_keys = set()
 
-def main():
+def main_loop():
     conn = db_connect()
 
     try:
         coingecko_self_test()
     except Exception as e:
-        print("coingecko_self_test error:", e)
+        print("coingecko_self_test error:", repr(e))
 
     ai_status = "ON ✅" if ai_enabled() and AI_FILTER_MODE != "off" else "OFF (disabled) ⚠️"
     send_message(
@@ -1114,23 +1127,34 @@ def main():
 
     while True:
         try:
+            conn = ensure_conn(conn)
+        except Exception:
+            pass
+
+        try:
             update_open_trades(conn)
         except Exception as e:
-            print("update_open_trades error:", e)
+            print("update_open_trades error:", repr(e))
 
         try:
             scan_and_collect(conn)
         except Exception as e:
-            print("scan_and_collect error:", e)
+            print("scan_and_collect error:", repr(e))
 
         try:
             do_send, last_sent_hour = should_send_now(last_sent_hour)
             if do_send:
                 send_hourly_update(conn)
         except Exception as e:
-            print("hourly_send error:", e)
+            print("hourly_send error:", repr(e))
 
         time.sleep(SCAN_EVERY_SECONDS)
 
 if __name__ == "__main__":
-    main()
+    while True:
+        try:
+            main_loop()
+        except Exception as e:
+            print("🔥 FATAL loop error (auto-restarting):", repr(e))
+            traceback.print_exc()
+            time.sleep(10)
