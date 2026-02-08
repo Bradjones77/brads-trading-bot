@@ -84,7 +84,6 @@ TP3_CAP_MAX_FALLBACK = float(os.getenv("TP3_CAP_MAX_FALLBACK", "0.12"))  # 12% s
 # ======================
 # COINGECKO OHLC SETTINGS (candles source)
 # ======================
-# CoinGecko OHLC endpoint supports days: 1, 7, 14, 30, 90, 180, 365, max
 COINGECKO_OHLC_DAYS = int(os.getenv("COINGECKO_OHLC_DAYS", "7"))
 COINGECKO_OHLC_CACHE_TTL_SECONDS = int(os.getenv("COINGECKO_OHLC_CACHE_TTL_SECONDS", str(10 * 60)))
 _ohlc_cache = {}  # coin_id -> (ts, highs, lows, closes)
@@ -92,8 +91,6 @@ _ohlc_cache = {}  # coin_id -> (ts, highs, lows, closes)
 # ======================
 # AI LEVEL OVERRIDE RULE (SAFETY)
 # ======================
-# ✅ AI can suggest SL/TP ONLY when we explicitly request it (request_ai_levels=True).
-# We request it ONLY when fallback caps were used (i.e. bot couldn't decide cleanly).
 AI_REQUEST_LEVELS_ONLY_ON_FALLBACK = (os.getenv("AI_REQUEST_LEVELS_ONLY_ON_FALLBACK", "1").strip() == "1")
 
 # ======================
@@ -419,7 +416,6 @@ def ai_levels_better(side, entry, fallback_levels, candidate_levels):
 
     if f_rr is None or a_rr is None:
         return False
-
     if a_rr + 1e-9 < f_rr:
         return False
 
@@ -500,7 +496,6 @@ def insert_trade(
 ):
     cur = conn.cursor()
 
-    # Try new-schema insert first; if DB hasn't been altered yet, fallback to old insert.
     try:
         cur.execute("""
             INSERT INTO trades (
@@ -521,7 +516,7 @@ def insert_trade(
     except Exception:
         conn.rollback()
 
-    # Old insert (always works)
+    # old insert fallback
     cur.execute("""
         INSERT INTO trades (
             ts_utc, symbol, coin_id, coin_name, side,
@@ -933,9 +928,6 @@ def scan_and_collect(conn):
 
         sl, tp1, tp2, tp3 = levels
 
-        # Add a clear, non-spam proof line
-        notes.append(f"Levels: {levels_source}")
-
         # AI logic
         final_conf = conf_after_mem
         ai_applied = False
@@ -972,7 +964,6 @@ def scan_and_collect(conn):
                 final_conf = max(0, min(100, conf_after_mem + int(adj)))
                 if reason:
                     ai_reason = f"{reason} ({int(adj):+d})"
-                    notes.append(f"AI: {ai_reason}")
 
                 # Apply AI only if requested + safe + better
                 if ai_requested and atr_val is not None and ai_levels:
@@ -987,16 +978,25 @@ def scan_and_collect(conn):
                         sl, tp1, tp2, tp3 = candidate
                         ai_applied = True
                         levels_source = "AI_APPLIED"
-                        notes.append("✅ AI levels applied")
-                    elif ai_requested:
-                        notes.append("⚠️ AI levels rejected (safety/better check)")
 
-            except Exception:
+            except Exception as e:
                 final_conf = conf_after_mem
-                notes.append("AI error -> kept bot levels")
+                err = repr(e)
+                print("AI error:", err)  # ✅ shows real reason in Railway logs
+                notes.append(f"AI error -> kept bot levels ({err[:120]})")
 
         if final_conf < CONFIDENCE_MIN:
             continue
+
+        # Final proof notes (always correct)
+        notes.append(f"Levels: {levels_source}")
+        if ai_enabled():
+            if ai_requested:
+                notes.append("AI requested: YES")
+            if ai_applied:
+                notes.append("AI applied: YES")
+            if ai_reason:
+                notes.append(f"AI: {ai_reason}")
 
         # Persist + save
         set_cooldown(conn, sym, side, cooldown_cache)
