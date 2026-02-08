@@ -3,8 +3,57 @@ import time
 import requests
 import psycopg2
 import traceback
+import threading
+import signal
+import sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from psycopg2 import OperationalError, InterfaceError
 from datetime import datetime, timezone, timedelta
+
+# ======================
+# RAILWAY KEEP-ALIVE (bind PORT so Railway doesn't stop container)
+# ======================
+_keepalive_started = False
+
+def start_keepalive_server():
+    """
+    Some Railway services expect a web process that binds to PORT.
+    This tiny server keeps the container alive while your bot runs.
+    """
+    global _keepalive_started
+    if _keepalive_started:
+        return
+    _keepalive_started = True
+
+    port = int(os.getenv("PORT", "8080"))
+    host = "0.0.0.0"
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"OK")
+
+        def log_message(self, format, *args):
+            return  # silence default logs
+
+    def run():
+        try:
+            httpd = HTTPServer((host, port), Handler)
+            print(f"✅ Keepalive server listening on {host}:{port}", flush=True)
+            httpd.serve_forever()
+        except Exception as e:
+            print("keepalive_server error:", repr(e), flush=True)
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+
+def _handle_sigterm(signum, frame):
+    print(f"⚠️ Received signal {signum} (Railway stopping container)", flush=True)
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM, _handle_sigterm)
 
 # ======================
 # OPTIONAL AI (FAIL-SAFE)
@@ -99,11 +148,6 @@ AI_REQUEST_LEVELS_ONLY_ON_FALLBACK = (os.getenv("AI_REQUEST_LEVELS_ONLY_ON_FALLB
 # OPENAI SAFETY: ONLY CALL AI WHEN NEEDED
 # ======================
 AI_FILTER_MODE = (os.getenv("AI_FILTER_MODE", "levels_only") or "").strip().lower()
-# modes:
-# - "off"               = never call OpenAI
-# - "levels_only"       = call OpenAI ONLY when ai_requested=True (recommended)
-# - "filter_and_levels" = call OpenAI for approve/reject always (more expensive)
-
 AI_MIN_CALL_INTERVAL_SECONDS = int(os.getenv("AI_MIN_CALL_INTERVAL_SECONDS", "2"))
 AI_COOLDOWN_ON_429_SECONDS = int(os.getenv("AI_COOLDOWN_ON_429_SECONDS", str(15 * 60)))
 
@@ -477,9 +521,6 @@ def _ensure_schema(conn):
         conn.rollback()
 
 def db_connect():
-    """
-    Connect to Postgres with retry so the bot doesn't die on boot/restarts.
-    """
     delay = 2
     while True:
         try:
@@ -520,17 +561,14 @@ def db_connect():
             conn.commit()
 
             _ensure_schema(conn)
-            print("✅ DB connected")
+            print("✅ DB connected", flush=True)
             return conn
         except Exception as e:
-            print("❌ DB connect failed, retrying:", repr(e))
+            print("❌ DB connect failed, retrying:", repr(e), flush=True)
             time.sleep(delay)
             delay = min(delay * 2, 30)
 
 def ensure_conn(conn):
-    """
-    If Postgres connection drops, reconnect without killing the bot.
-    """
     try:
         if conn is None or conn.closed != 0:
             return db_connect()
@@ -539,7 +577,7 @@ def ensure_conn(conn):
         conn.commit()
         return conn
     except (OperationalError, InterfaceError) as e:
-        print("⚠️ DB connection lost, reconnecting:", repr(e))
+        print("⚠️ DB connection lost, reconnecting:", repr(e), flush=True)
         try:
             if conn:
                 conn.close()
@@ -547,7 +585,7 @@ def ensure_conn(conn):
             pass
         return db_connect()
     except Exception as e:
-        print("⚠️ DB ensure_conn error:", repr(e))
+        print("⚠️ DB ensure_conn error:", repr(e), flush=True)
         return conn
 
 def insert_trade(
@@ -580,7 +618,6 @@ def insert_trade(
         return
     except Exception:
         conn.rollback()
-        # Old insert fallback (schema might be mid-migration)
         cur.execute("""
             INSERT INTO trades (
                 ts_utc, symbol, coin_id, coin_name, side,
@@ -917,7 +954,6 @@ def scan_and_collect(conn):
         if not sym:
             continue
 
-        # cooldown
         try:
             if not cooldown_ok(sym, side, cooldown_cache):
                 continue
@@ -945,19 +981,16 @@ def scan_and_collect(conn):
         highs, lows, closes = fetch_coingecko_ohlc_usd(coin_id, days=COINGECKO_OHLC_DAYS)
         atr_val = _atr(highs, lows, closes, period=14) if highs and lows and closes else None
 
-        # Bot primary levels (no caps)
         levels_source = "BOT_CANDLES"
         levels = build_levels_from_candles(entry, side, highs, lows, closes, use_caps=False)
 
         used_fallback_caps = False
 
-        # Fallback caps using candles if bot couldn't decide
         if not levels and highs and lows and closes:
             used_fallback_caps = True
             levels_source = "FALLBACK_CAPS_CANDLES"
             levels = build_levels_from_candles(entry, side, highs, lows, closes, use_caps=True)
 
-        # Fallback caps using 24h high/low if no candles
         if not levels:
             used_fallback_caps = True
             levels_source = "FALLBACK_CAPS_24H"
@@ -991,7 +1024,6 @@ def scan_and_collect(conn):
 
         sl, tp1, tp2, tp3 = levels
 
-        # AI logic (safe-gated)
         final_conf = conf_after_mem
         ai_applied = False
         ai_requested = False
@@ -1035,7 +1067,6 @@ def scan_and_collect(conn):
                     if reason:
                         ai_reason = f"{reason} ({int(adj):+d})"
 
-                    # Apply AI only if requested + safe + better
                     if ai_requested and atr_val is not None and ai_levels:
                         candidate = validate_ai_levels(
                             side=side,
@@ -1051,7 +1082,7 @@ def scan_and_collect(conn):
 
                 except Exception as e:
                     err = repr(e)
-                    print("AI error:", err)
+                    print("AI error:", err, flush=True)
                     if "429" in err or "Too Many Requests" in err:
                         mark_ai_cooldown()
                         notes.append("AI rate-limited -> cooling down, kept bot levels")
@@ -1062,7 +1093,6 @@ def scan_and_collect(conn):
         if final_conf < CONFIDENCE_MIN:
             continue
 
-        # Notes
         notes.append(f"Levels: {levels_source}")
         if ai_enabled() and AI_FILTER_MODE != "off":
             if ai_requested:
@@ -1072,7 +1102,6 @@ def scan_and_collect(conn):
             if ai_reason:
                 notes.append(f"AI: {ai_reason}")
 
-        # Persist + save
         set_cooldown(conn, sym, side, cooldown_cache)
         insert_trade(
             conn,
@@ -1118,12 +1147,15 @@ def send_hourly_update(conn):
     pending_keys = set()
 
 def main_loop():
+    # START PORT SERVER FIRST (prevents Railway from stopping container)
+    start_keepalive_server()
+
     conn = db_connect()
 
     try:
         coingecko_self_test()
     except Exception as e:
-        print("coingecko_self_test error:", repr(e))
+        print("coingecko_self_test error:", repr(e), flush=True)
 
     ai_status = "ON ✅" if ai_enabled() and AI_FILTER_MODE != "off" else "OFF (disabled) ⚠️"
     send_message(
@@ -1149,28 +1181,28 @@ def main_loop():
         try:
             update_open_trades(conn)
         except Exception as e:
-            print("update_open_trades error:", repr(e))
+            print("update_open_trades error:", repr(e), flush=True)
 
         try:
             scan_and_collect(conn)
         except Exception as e:
-            print("scan_and_collect error:", repr(e))
+            print("scan_and_collect error:", repr(e), flush=True)
 
         try:
             do_send, last_sent_hour = should_send_now(last_sent_hour)
             if do_send:
                 send_hourly_update(conn)
         except Exception as e:
-            print("hourly_send error:", repr(e))
+            print("hourly_send error:", repr(e), flush=True)
 
         time.sleep(SCAN_EVERY_SECONDS)
 
 if __name__ == "__main__":
-    # NEVER DIE runner (prevents container stop)
+    # NEVER DIE runner
     while True:
         try:
             main_loop()
         except Exception as e:
-            print("🔥 FATAL loop error (auto-restarting):", repr(e))
+            print("🔥 FATAL loop error (auto-restarting):", repr(e), flush=True)
             traceback.print_exc()
             time.sleep(10)
