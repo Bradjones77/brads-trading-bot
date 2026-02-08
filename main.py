@@ -94,6 +94,35 @@ _ohlc_cache = {}  # coin_id -> (ts, highs, lows, closes)
 AI_REQUEST_LEVELS_ONLY_ON_FALLBACK = (os.getenv("AI_REQUEST_LEVELS_ONLY_ON_FALLBACK", "1").strip() == "1")
 
 # ======================
+# OPENAI SAFETY: ONLY CALL AI WHEN NEEDED (prevents 429 spam)
+# ======================
+AI_FILTER_MODE = (os.getenv("AI_FILTER_MODE", "levels_only") or "").strip().lower()
+# modes:
+# - "off"             = never call OpenAI
+# - "levels_only"     = call OpenAI ONLY when ai_requested=True (recommended)
+# - "filter_and_levels" = call OpenAI for approve/reject always (more expensive)
+
+AI_MIN_CALL_INTERVAL_SECONDS = int(os.getenv("AI_MIN_CALL_INTERVAL_SECONDS", "2"))
+AI_COOLDOWN_ON_429_SECONDS = int(os.getenv("AI_COOLDOWN_ON_429_SECONDS", str(15 * 60)))
+
+_last_ai_call_ts = 0.0
+_ai_cooldown_until = 0.0
+
+def can_call_ai_now() -> bool:
+    global _last_ai_call_ts, _ai_cooldown_until
+    now = time.time()
+    if now < _ai_cooldown_until:
+        return False
+    if (now - _last_ai_call_ts) < AI_MIN_CALL_INTERVAL_SECONDS:
+        return False
+    _last_ai_call_ts = now
+    return True
+
+def mark_ai_cooldown():
+    global _ai_cooldown_until
+    _ai_cooldown_until = time.time() + AI_COOLDOWN_ON_429_SECONDS
+
+# ======================
 # Requests session
 # ======================
 SESSION = requests.Session()
@@ -928,69 +957,86 @@ def scan_and_collect(conn):
 
         sl, tp1, tp2, tp3 = levels
 
-        # AI logic
+        # AI logic (safe-gated)
         final_conf = conf_after_mem
         ai_applied = False
         ai_requested = False
         ai_reason = None
 
-        if ai_enabled():
-            try:
-                ai_requested = bool(used_fallback_caps and AI_REQUEST_LEVELS_ONLY_ON_FALLBACK)
+        if ai_enabled() and AI_FILTER_MODE != "off":
+            ai_requested = bool(used_fallback_caps and AI_REQUEST_LEVELS_ONLY_ON_FALLBACK)
 
-                mem_total, mem_wr = get_recent_side_performance(conn, sym, side)
-                ctx = build_ai_context(
-                    coin_name=coin_name,
-                    sym=sym,
-                    side=side,
-                    entry=entry,
-                    sl=sl,
-                    tp1=tp1,
-                    tp2=tp2,
-                    tp3=tp3,
-                    base_conf=conf_after_mem,
-                    chg1h=chg1h,
-                    chg24=chg24,
-                    atr_value=atr_val,
-                    mem_total=mem_total,
-                    mem_winrate=mem_wr,
-                    request_ai_levels=ai_requested
-                )
+            # Only call AI if:
+            # - filter_and_levels => always
+            # - levels_only => only when requested (fallback case)
+            want_ai_call = (
+                (AI_FILTER_MODE == "filter_and_levels") or
+                (AI_FILTER_MODE == "levels_only" and ai_requested)
+            )
 
-                approved, adj, reason, ai_levels = judge_trade(ctx)
-                if not approved:
-                    continue
-
-                final_conf = max(0, min(100, conf_after_mem + int(adj)))
-                if reason:
-                    ai_reason = f"{reason} ({int(adj):+d})"
-
-                # Apply AI only if requested + safe + better
-                if ai_requested and atr_val is not None and ai_levels:
-                    candidate = validate_ai_levels(
+            if want_ai_call and can_call_ai_now():
+                try:
+                    mem_total, mem_wr = get_recent_side_performance(conn, sym, side)
+                    ctx = build_ai_context(
+                        coin_name=coin_name,
+                        sym=sym,
                         side=side,
                         entry=entry,
+                        sl=sl,
+                        tp1=tp1,
+                        tp2=tp2,
+                        tp3=tp3,
+                        base_conf=conf_after_mem,
+                        chg1h=chg1h,
+                        chg24=chg24,
                         atr_value=atr_val,
-                        fallback_levels=(sl, tp1, tp2, tp3),
-                        ai_levels=ai_levels
+                        mem_total=mem_total,
+                        mem_winrate=mem_wr,
+                        request_ai_levels=ai_requested
                     )
-                    if candidate != (sl, tp1, tp2, tp3) and ai_levels_better(side, entry, (sl, tp1, tp2, tp3), candidate):
-                        sl, tp1, tp2, tp3 = candidate
-                        ai_applied = True
-                        levels_source = "AI_APPLIED"
 
-            except Exception as e:
+                    approved, adj, reason, ai_levels = judge_trade(ctx)
+
+                    if AI_FILTER_MODE == "filter_and_levels" and not approved:
+                        continue
+
+                    final_conf = max(0, min(100, conf_after_mem + int(adj)))
+                    if reason:
+                        ai_reason = f"{reason} ({int(adj):+d})"
+
+                    # Apply AI only if requested + safe + better
+                    if ai_requested and atr_val is not None and ai_levels:
+                        candidate = validate_ai_levels(
+                            side=side,
+                            entry=entry,
+                            atr_value=atr_val,
+                            fallback_levels=(sl, tp1, tp2, tp3),
+                            ai_levels=ai_levels
+                        )
+                        if candidate != (sl, tp1, tp2, tp3) and ai_levels_better(side, entry, (sl, tp1, tp2, tp3), candidate):
+                            sl, tp1, tp2, tp3 = candidate
+                            ai_applied = True
+                            levels_source = "AI_APPLIED"
+
+                except Exception as e:
+                    err = repr(e)
+                    print("AI error:", err)
+                    if "429" in err or "Too Many Requests" in err:
+                        mark_ai_cooldown()
+                        notes.append("AI rate-limited -> cooling down, kept bot levels")
+                    else:
+                        notes.append(f"AI error -> kept bot levels ({err[:120]})")
+                    final_conf = conf_after_mem
+            else:
+                # no AI call
                 final_conf = conf_after_mem
-                err = repr(e)
-                print("AI error:", err)  # ✅ shows real reason in Railway logs
-                notes.append(f"AI error -> kept bot levels ({err[:120]})")
 
         if final_conf < CONFIDENCE_MIN:
             continue
 
         # Final proof notes (always correct)
         notes.append(f"Levels: {levels_source}")
-        if ai_enabled():
+        if ai_enabled() and AI_FILTER_MODE != "off":
             if ai_requested:
                 notes.append("AI requested: YES")
             if ai_applied:
@@ -1006,8 +1052,8 @@ def scan_and_collect(conn):
             entry, sl, tp1, tp2, tp3,
             final_conf, chg1h, chg24,
             levels_source=levels_source,
-            ai_requested=ai_requested if ai_enabled() else None,
-            ai_applied=ai_applied if ai_enabled() else None,
+            ai_requested=ai_requested if (ai_enabled() and AI_FILTER_MODE != "off") else None,
+            ai_applied=ai_applied if (ai_enabled() and AI_FILTER_MODE != "off") else None,
             ai_reason=ai_reason
         )
 
@@ -1051,12 +1097,12 @@ def main():
     except Exception as e:
         print("coingecko_self_test error:", e)
 
-    ai_status = "ON ✅" if ai_enabled() else "OFF (no OPENAI_API_KEY) ⚠️"
+    ai_status = "ON ✅" if ai_enabled() and AI_FILTER_MODE != "off" else "OFF (disabled) ⚠️"
     send_message(
         "✅ Bot online. Analysing 24/7.\n"
         "⏳ Signals are sent once per hour.\n"
         f"⏱ Scan interval: {SCAN_EVERY_SECONDS}s\n"
-        f"🤖 AI Filter: {ai_status}\n"
+        f"🤖 AI Mode: {AI_FILTER_MODE} | {ai_status}\n"
         f"🧾 CoinGecko Whitelist: {len(COINGECKO_COIN_IDS)} coins ✅\n"
         f"🕯️ Candles: CoinGecko OHLC ({COINGECKO_OHLC_DAYS}d) ✅\n"
         "🛟 TP caps are FALLBACK-ONLY\n"
