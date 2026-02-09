@@ -848,8 +848,22 @@ def build_ai_context(
         "rule": "AI may suggest SL/TP only. Entry is bot-controlled."
     }
 
+# ✅ SMART PRICE FORMAT:
+# - >= 1.00        -> 2 decimals
+# - 0.01 to <1.00  -> 8 decimals
+# - < 0.01         -> 16 decimals
 def fmt_price(p):
-    return f"${p:,.6f}" if p < 1 else f"${p:,.2f}"
+    try:
+        p = float(p)
+    except Exception:
+        return "N/A"
+
+    ap = abs(p)
+    if ap >= 1:
+        return f"${p:,.2f}"
+    if ap >= 0.01:
+        return f"${p:.8f}"
+    return f"${p:.16f}"
 
 def format_signal_msg(coin_name, sym, side, entry, sl, tp1, tp2, tp3, conf, chg1h, chg24, time_str, notes=None):
     direction = "🟢 *LONG (BUY)*" if side == "LONG" else "🔴 *SHORT (SELL)*"
