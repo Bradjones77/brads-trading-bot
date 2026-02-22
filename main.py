@@ -94,7 +94,9 @@ if not COINGECKO_BASE_URL.startswith("http"):
 # ======================
 SCAN_EVERY_SECONDS = int(os.getenv("SCAN_EVERY_SECONDS", "600"))  # scan every 10 minutes by default
 CONFIDENCE_MIN = int(os.getenv("CONFIDENCE_MIN", "65"))
-MAX_SIGNALS_PER_HOUR = int(os.getenv("MAX_SIGNALS_PER_HOUR", "10"))
+
+# ✅ CHANGED: default top signals per 30-minute send window is 5 (was 10 per hour)
+MAX_SIGNALS_PER_HOUR = int(os.getenv("MAX_SIGNALS_PER_HOUR", "5"))
 
 MIN_24H = float(os.getenv("MIN_24H", "1.5"))
 MIN_1H = float(os.getenv("MIN_1H", "0.4"))
@@ -893,7 +895,7 @@ def format_signal_msg(coin_name, sym, side, entry, sl, tp1, tp2, tp3, conf, chg1
 def format_hourly_header(conn, time_str):
     all_win, all_total, win7, total7 = get_win_stats(conn)
     return (
-        f"🧠 *Hourly Market Scan* ({time_str})\n"
+        f"🧠 *Market Scan* ({time_str})\n"
         f"📊 *Win Rate:* All-time `{all_win:.1f}%` ({all_total} trades) | Last 7D `{win7:.1f}%` ({total7} trades)\n"
         f"━━━━━━━━━━━━━━"
     )
@@ -1136,13 +1138,16 @@ def scan_and_collect(conn):
             )
         )
 
+        # ✅ still caps how many we collect per send window (now 30-min)
         if len(pending_signals) >= MAX_SIGNALS_PER_HOUR:
             break
 
-def should_send_now(last_sent_hour):
+# ✅ CHANGED: send window is every 30 minutes (00 and 30)
+def should_send_now(last_sent_window):
     now = datetime.now(timezone.utc)
-    hour_key = now.strftime("%Y-%m-%d %H")
-    return (hour_key != last_sent_hour), hour_key
+    minute_bucket = 0 if now.minute < 30 else 30
+    window_key = now.strftime("%Y-%m-%d %H") + f":{minute_bucket:02d}"
+    return (window_key != last_sent_window), window_key
 
 def send_hourly_update(conn):
     global pending_signals, pending_keys
@@ -1174,7 +1179,7 @@ def main_loop():
     ai_status = "ON ✅" if ai_enabled() and AI_FILTER_MODE != "off" else "OFF (disabled) ⚠️"
     send_message(
         "✅ Bot online. Analysing 24/7.\n"
-        "⏳ Signals are sent once per hour.\n"
+        "⏳ Signals are sent every 30 minutes.\n"
         f"⏱ Scan interval: {SCAN_EVERY_SECONDS}s\n"
         f"🤖 AI Mode: {AI_FILTER_MODE} | {ai_status}\n"
         f"🧾 CoinGecko Whitelist: {len(COINGECKO_COIN_IDS)} coins ✅\n"
@@ -1184,7 +1189,7 @@ def main_loop():
         "_Not financial advice_"
     )
 
-    last_sent_hour = None
+    last_sent_window = None
 
     while True:
         try:
@@ -1203,7 +1208,7 @@ def main_loop():
             print("scan_and_collect error:", repr(e), flush=True)
 
         try:
-            do_send, last_sent_hour = should_send_now(last_sent_hour)
+            do_send, last_sent_window = should_send_now(last_sent_window)
             if do_send:
                 send_hourly_update(conn)
         except Exception as e:
