@@ -83,19 +83,13 @@ COINGECKO_BASE_URL = (os.getenv(
 if not BOT_TOKEN or not CHAT_ID or not DATABASE_URL:
     raise RuntimeError("BOT_TOKEN, CHAT_ID, or DATABASE_URL missing")
 
-if not COINGECKO_API_KEY:
-    raise RuntimeError("COINGECKO_API_KEY missing (set Railway Variable COINGECKO_API_KEY)")
-
-if not COINGECKO_BASE_URL.startswith("http"):
-    raise RuntimeError(f"COINGECKO_BASE_URL looks wrong: {COINGECKO_BASE_URL!r}")
-
 # ======================
 # SETTINGS
 # ======================
-SCAN_EVERY_SECONDS = int(os.getenv("SCAN_EVERY_SECONDS", "600"))  # scan every 10 minutes by default
-CONFIDENCE_MIN = int(os.getenv("CONFIDENCE_MIN", "65"))
+SCAN_EVERY_SECONDS = max(60, int(os.getenv("SCAN_EVERY_SECONDS", "60")))  # target interval; scan runtime adds to cadence
+CONFIDENCE_MIN = max(75, int(os.getenv("CONFIDENCE_MIN", "75")))
 
-# ✅ CHANGED: default top signals per 30-minute send window is 5 (was 10 per hour)
+# Maximum qualifying signals per scan (duplicate cooldown still applies)
 MAX_SIGNALS_PER_HOUR = int(os.getenv("MAX_SIGNALS_PER_HOUR", "5"))
 
 MIN_24H = float(os.getenv("MIN_24H", "1.5"))
@@ -117,11 +111,11 @@ MEM_LOOKBACK_DAYS = int(os.getenv("MEM_LOOKBACK_DAYS", "14"))
 COINGECKO_TIMEOUT = int(os.getenv("COINGECKO_TIMEOUT", "30"))
 COINGECKO_MAX_RETRIES = int(os.getenv("COINGECKO_MAX_RETRIES", "6"))
 
-MARKETS_CACHE_TTL_SECONDS = int(os.getenv("MARKETS_CACHE_TTL_SECONDS", str(20 * 60)))
+MARKETS_CACHE_TTL_SECONDS = min(60, max(0, int(os.getenv("MARKETS_CACHE_TTL_SECONDS", "30"))))
 _last_markets = None
 _last_markets_ts = 0
 
-OPEN_TRADES_CHECK_EVERY_SECONDS = int(os.getenv("OPEN_TRADES_CHECK_EVERY_SECONDS", str(30 * 60)))
+OPEN_TRADES_CHECK_EVERY_SECONDS = int(os.getenv("OPEN_TRADES_CHECK_EVERY_SECONDS", "60"))
 _last_open_check_ts = 0
 
 TELEGRAM_MAX_CHARS = int(os.getenv("TELEGRAM_MAX_CHARS", "3900"))
@@ -138,7 +132,7 @@ TP3_CAP_MAX_FALLBACK = float(os.getenv("TP3_CAP_MAX_FALLBACK", "0.12"))  # 12% s
 # COINGECKO OHLC SETTINGS (candles source)
 # ======================
 COINGECKO_OHLC_DAYS = int(os.getenv("COINGECKO_OHLC_DAYS", "7"))
-COINGECKO_OHLC_CACHE_TTL_SECONDS = int(os.getenv("COINGECKO_OHLC_CACHE_TTL_SECONDS", str(10 * 60)))
+COINGECKO_OHLC_CACHE_TTL_SECONDS = min(60, max(0, int(os.getenv("COINGECKO_OHLC_CACHE_TTL_SECONDS", "45"))))
 _ohlc_cache = {}  # coin_id -> (ts, highs, lows, closes)
 
 # ======================
@@ -180,11 +174,35 @@ SESSION.headers.update({
     "x-cg-pro-api-key": COINGECKO_API_KEY
 })
 
+BITGET_BASE_URL = "https://api.bitget.com"
+BITGET_PRODUCT_TYPE = "USDT-FUTURES"
+BITGET_TIMEOUT = 12
+BITGET_MAX_RETRIES = 2
+
+
+def bitget_public_get(path, params):
+    """Public market data only. Never supply an execution API key."""
+    last_error = None
+    for attempt in range(BITGET_MAX_RETRIES):
+        try:
+            response = requests.get(BITGET_BASE_URL + path, params=params, timeout=BITGET_TIMEOUT)
+            response.raise_for_status()
+            payload = response.json()
+            if payload.get("code") != "00000":
+                raise RuntimeError(f"Bitget public API: {payload.get('code')} {payload.get('msg')}")
+            return payload.get("data")
+        except Exception as exc:
+            last_error = exc
+            if attempt + 1 < BITGET_MAX_RETRIES:
+                time.sleep(2)
+    raise RuntimeError(f"Bitget public market data unavailable: {last_error!r}")
+
+
 def coingecko_self_test():
-    url = f"{COINGECKO_BASE_URL}/ping"
-    r = SESSION.get(url, timeout=15)
-    r.raise_for_status()
-    print("✅ CoinGecko OK:", r.json())
+    rows = bitget_public_get("/api/v2/mix/market/tickers", {"productType": BITGET_PRODUCT_TYPE})
+    if not isinstance(rows, list) or not rows:
+        raise RuntimeError("Bitget futures tickers empty")
+    print(f"✅ Bitget public USDT futures OK: {len(rows)} tickers", flush=True)
 
 # ==============================
 # COINGECKO WHITELIST (YOUR LIST)
@@ -274,78 +292,102 @@ def _chunk_list(items, chunk_size):
     for i in range(0, len(items), chunk_size):
         yield items[i:i + chunk_size]
 
+# Public Bitget futures market data replaces CoinGecko market and OHLC feeds.
+# Symbol filtering uses the existing CoinGecko whitelist, mapped by ticker.
+# A ticker collision can still occur; review symbol mapping before production.
+BITGET_ALLOWED_TICKERS = {
+    "BTC", "ETH", "BNB", "XRP", "SOL", "ADA", "DOGE", "TRX", "BCH", "LTC",
+    "DOT", "AVAX", "ATOM", "XLM", "ETC", "ICP", "NEAR", "ALGO", "APT", "FIL",
+    "VET", "HBAR", "ZEC", "XMR", "LINK", "UNI", "AAVE", "CAKE", "CRV", "SNX",
+    "COMP", "INJ", "LDO", "MORPHO", "DYDX", "GRT", "RSR", "QTUM", "KNC", "LRC",
+    "BNT", "ZRX", "GNO", "BAND", "ARB", "OP", "STX", "STRK", "ZRO", "TIA",
+    "SKL", "OSMO", "TAO", "RENDER", "FET", "IO", "NMR", "SHIB", "PEPE", "BONK",
+    "FLOKI", "WIF", "BOME", "PNUT", "TRUMP", "TWT", "NEXO", "KCS", "OKB", "GT",
+    "HTX", "MX", "BGB", "XDC", "IOTA", "DASH", "ZEN", "SC", "HOT", "RVN",
+    "XVG", "ZIL", "TFUEL", "THETA", "BAT", "AXS", "APE", "SAND", "GALA", "IMX",
+    "YGG", "EDU", "JASMY", "KITE", "WAL", "S", "SFP", "ID", "ME", "POWR",
+    "AUDIO", "FLUX", "ONG", "SAGA", "OGN", "CVC", "IQ", "STRAX", "WAXP",
+    "CYBER", "AMP", "ROSE", "LPT", "GAS", "W", "EGLD", "EIGEN",
+}
+# Do not issue leveraged futures signals on stablecoins or exchange-pegged assets.
+BITGET_EXCLUDED_TICKERS = {"USDT", "USDC", "DAI", "TUSD", "FDUSD", "USDE", "RLUSD", "FRAX", "PYUSD"}
+
+
+def fetch_bitget_candles(symbol, granularity="1H", limit=50):
+    data = bitget_public_get("/api/v2/mix/market/candles", {
+        "symbol": symbol, "productType": BITGET_PRODUCT_TYPE,
+        "granularity": granularity, "limit": str(limit),
+    })
+    if not isinstance(data, list) or len(data) < 3:
+        raise RuntimeError(f"Insufficient Bitget candles: {symbol}")
+    rows = sorted(data, key=lambda row: int(row[0]))
+    # The newest candle may still be forming. Use closed candles for ATR.
+    return rows[:-1]
+
+
 def fetch_whitelist_markets():
     global _last_markets, _last_markets_ts
     now = time.time()
-    if _last_markets and (now - _last_markets_ts) < MARKETS_CACHE_TTL_SECONDS:
+    if _last_markets is not None and now - _last_markets_ts < MARKETS_CACHE_TTL_SECONDS:
         return _last_markets
+    tickers = bitget_public_get("/api/v2/mix/market/tickers", {"productType": BITGET_PRODUCT_TYPE})
+    if not isinstance(tickers, list):
+        raise RuntimeError("Unexpected Bitget ticker response")
+    rows = []
+    for ticker in tickers:
+        symbol = str(ticker.get("symbol", "")).upper()
+        if not symbol.endswith("USDT"):
+            continue
+        base = symbol[:-4]
+        if base not in BITGET_ALLOWED_TICKERS or base in BITGET_EXCLUDED_TICKERS:
+            continue
+        try:
+            price = float(ticker["lastPr"])
+            # Bitget change24h is a fractional change, e.g. 0.02 means +2%.
+            change24 = float(ticker["change24h"]) * 100.0
+            if price <= 0:
+                continue
+            candles = fetch_bitget_candles(symbol, "1H", 4)
+            previous_close = float(candles[-1][4])
+            change1h = (price / previous_close - 1.0) * 100.0
+            rows.append({"id": symbol, "symbol": base, "name": base,
+                         "current_price": price, "price_change_percentage_1h_in_currency": change1h,
+                         "price_change_percentage_24h": change24,
+                         "high_24h": float(ticker["high24h"]),
+                         "low_24h": float(ticker["low24h"])})
+        except Exception as exc:
+            print(f"Bitget ticker skipped {symbol}: {exc!r}", flush=True)
+    if not rows:
+        raise RuntimeError("No valid Bitget futures markets; refusing to send stale signals")
+    _last_markets, _last_markets_ts = rows, time.time()
+    return rows
 
-    url = f"{COINGECKO_BASE_URL}/coins/markets"
-    all_rows = []
-    for chunk in _chunk_list(sorted(COINGECKO_COIN_IDS), 200):
-        params = {
-            "vs_currency": "usd",
-            "ids": ",".join(chunk),
-            "order": "market_cap_desc",
-            "sparkline": "false",
-            "price_change_percentage": "1h,24h",
-            "per_page": len(chunk),
-            "page": 1,
-        }
-        data = _get_json_with_backoff(url, params)
-        if isinstance(data, list):
-            all_rows.extend(data)
-
-    _last_markets = all_rows
-    _last_markets_ts = now
-    return all_rows
 
 def fetch_simple_price_usd(coin_ids):
     if not coin_ids:
         return {}
-    coin_ids = list(dict.fromkeys(coin_ids))[:200]
-    url = f"{COINGECKO_BASE_URL}/simple/price"
-    params = {"ids": ",".join(coin_ids), "vs_currencies": "usd"}
-    data = _get_json_with_backoff(url, params)
-    return {k: v.get("usd") for k, v in data.items()}
+    data = bitget_public_get("/api/v2/mix/market/tickers", {"productType": BITGET_PRODUCT_TYPE})
+    wanted = set(coin_ids)
+    return {row["symbol"]: float(row["lastPr"]) for row in data
+            if row.get("symbol") in wanted and float(row.get("lastPr") or 0) > 0}
 
-# ======================
-# COINGECKO OHLC CANDLES
-# ======================
+
 def fetch_coingecko_ohlc_usd(coin_id: str, days: int = COINGECKO_OHLC_DAYS):
-    if not coin_id:
-        return None, None, None
-
     now = time.time()
     cached = _ohlc_cache.get(coin_id)
-    if cached and (now - cached[0]) < COINGECKO_OHLC_CACHE_TTL_SECONDS:
+    if cached and now - cached[0] < COINGECKO_OHLC_CACHE_TTL_SECONDS:
         return cached[1], cached[2], cached[3]
-
-    url = f"{COINGECKO_BASE_URL}/coins/{coin_id}/ohlc"
-    params = {"vs_currency": "usd", "days": int(days)}
-
     try:
-        rows = _get_json_with_backoff(url, params)
-        if not isinstance(rows, list) or len(rows) < 20:
-            return None, None, None
-
-        highs, lows, closes = [], [], []
-        for r in rows:
-            if not isinstance(r, (list, tuple)) or len(r) < 5:
-                continue
-            try:
-                highs.append(float(r[2]))
-                lows.append(float(r[3]))
-                closes.append(float(r[4]))
-            except Exception:
-                continue
-
+        candles = fetch_bitget_candles(coin_id, "1H", 50)
+        highs = [float(row[2]) for row in candles]
+        lows = [float(row[3]) for row in candles]
+        closes = [float(row[4]) for row in candles]
         if len(closes) < 20:
             return None, None, None
-
         _ohlc_cache[coin_id] = (now, highs, lows, closes)
         return highs, lows, closes
-    except Exception:
+    except Exception as exc:
+        print(f"Bitget OHLC unavailable {coin_id}: {exc!r}", flush=True)
         return None, None, None
 
 # ======================
@@ -735,13 +777,16 @@ def send_message(text):
             if r.status_code >= 400:
                 if attempt == 0:
                     r2 = _telegram_post(text, parse_mode=None)
-                    if r2.ok:
-                        return
+                    if r2.ok and r2.json().get("ok") is True:
+                        return True
                 r.raise_for_status()
-            return
+            if r.json().get("ok") is True:
+                return True
+            raise RuntimeError("Telegram API did not confirm delivery")
         except Exception:
             time.sleep(delay)
             delay = min(delay * 2, 20)
+    return False
 
 def send_long_message(text):
     if not text:
@@ -946,9 +991,12 @@ def scan_and_collect(conn):
     ts_iso = datetime.now(timezone.utc).isoformat()
     cooldown_cache = load_cooldowns(conn)
 
+    sent_this_scan = 0
     for c in markets:
+        if sent_this_scan >= MAX_SIGNALS_PER_HOUR:
+            break
         coin_id = c.get("id")
-        if not coin_id or coin_id not in COINGECKO_COIN_IDS:
+        if not coin_id or not coin_id.endswith("USDT"):
             continue
 
         chg1h = c.get("price_change_percentage_1h_in_currency")
@@ -1118,6 +1166,29 @@ def scan_and_collect(conn):
             if ai_reason:
                 notes.append(f"AI: {ai_reason}")
 
+        # Revalidate the entry against the executable venue immediately before alerting.
+        # Skip rather than deliver a signal whose price has moved too far.
+        try:
+            latest = bitget_public_get("/api/v2/mix/market/ticker", {
+                "symbol": coin_id, "productType": BITGET_PRODUCT_TYPE
+            })
+            latest_row = latest[0] if isinstance(latest, list) else latest
+            fresh_entry = float(latest_row["lastPr"])
+            if fresh_entry <= 0 or abs(fresh_entry / entry - 1.0) > 0.0025:
+                print(f"Stale entry rejected {coin_id}: {entry} -> {fresh_entry}", flush=True)
+                continue
+        except Exception as exc:
+            print(f"Fresh Bitget price unavailable {coin_id}: {exc!r}", flush=True)
+            continue
+
+        signal_text = format_signal_msg(
+            coin_name, sym, side, entry, sl, tp1, tp2, tp3,
+            final_conf, chg1h, chg24, datetime.now(timezone.utc).strftime("%H:%M UTC"), notes=notes
+        )
+        # Send only this signal; do not hold it for the next half-hour window.
+        if not send_message(signal_text):
+            print(f"Telegram send failed; signal not recorded: {coin_id}", flush=True)
+            continue
         set_cooldown(conn, sym, side, cooldown_cache)
         insert_trade(
             conn,
@@ -1130,40 +1201,8 @@ def scan_and_collect(conn):
             ai_reason=ai_reason
         )
 
-        pending_keys.add(key)
-        pending_signals.append(
-            format_signal_msg(
-                coin_name, sym, side, entry, sl, tp1, tp2, tp3,
-                final_conf, chg1h, chg24, now_str, notes=notes
-            )
-        )
-
-        # ✅ still caps how many we collect per send window (now 30-min)
-        if len(pending_signals) >= MAX_SIGNALS_PER_HOUR:
-            break
-
-# ✅ CHANGED: send window is every 30 minutes (00 and 30)
-def should_send_now(last_sent_window):
-    now = datetime.now(timezone.utc)
-    minute_bucket = 0 if now.minute < 30 else 30
-    window_key = now.strftime("%Y-%m-%d %H") + f":{minute_bucket:02d}"
-    return (window_key != last_sent_window), window_key
-
-def send_hourly_update(conn):
-    global pending_signals, pending_keys
-
-    now_str = datetime.now(timezone.utc).strftime("%H:%M UTC")
-    header = format_hourly_header(conn, now_str)
-
-    if pending_signals:
-        body = "\n\n".join(pending_signals)
-        msg = f"{header}\n\n{body}"
-        send_long_message(msg)
-    else:
-        send_message(f"{header}\n\n❌ *No coins worth investing in.*\n\n_Not financial advice_")
-
-    pending_signals = []
-    pending_keys = set()
+        sent_this_scan += 1
+        print(f"Sent fresh Bitget signal {coin_id} {side} confidence={final_conf}", flush=True)
 
 def main_loop():
     # START PORT SERVER FIRST (prevents Railway from stopping container)
@@ -1179,17 +1218,15 @@ def main_loop():
     ai_status = "ON ✅" if ai_enabled() and AI_FILTER_MODE != "off" else "OFF (disabled) ⚠️"
     send_message(
         "✅ Bot online. Analysing 24/7.\n"
-        "⏳ Signals are sent every 30 minutes.\n"
+        "📨 Qualifying signals sent immediately (no 30-minute queue).\n"
         f"⏱ Scan interval: {SCAN_EVERY_SECONDS}s\n"
         f"🤖 AI Mode: {AI_FILTER_MODE} | {ai_status}\n"
-        f"🧾 CoinGecko Whitelist: {len(COINGECKO_COIN_IDS)} coins ✅\n"
-        f"🕯️ Candles: CoinGecko OHLC ({COINGECKO_OHLC_DAYS}d) ✅\n"
+        f"🧾 Bitget futures symbol filter: {len(BITGET_ALLOWED_TICKERS)} tickers ✅\n"
+        "🕯️ Candles: Bitget public USDT futures 1H ✅\n"
         "🛟 TP caps are FALLBACK-ONLY\n"
         "🧾 Proof: message notes + DB columns levels_source / ai_requested / ai_applied\n"
         "_Not financial advice_"
     )
-
-    last_sent_window = None
 
     while True:
         try:
@@ -1206,13 +1243,6 @@ def main_loop():
             scan_and_collect(conn)
         except Exception as e:
             print("scan_and_collect error:", repr(e), flush=True)
-
-        try:
-            do_send, last_sent_window = should_send_now(last_sent_window)
-            if do_send:
-                send_hourly_update(conn)
-        except Exception as e:
-            print("hourly_send error:", repr(e), flush=True)
 
         time.sleep(SCAN_EVERY_SECONDS)
 
